@@ -1,4 +1,4 @@
-name: bmad-implement
+name: archon-bmad-story-automator
 description: |
   Use when: BMAD planning is done (sprint-status.yaml exists) and you want to automate the
   implementation loop for one or more stories/epics — the same cycle the upstream
@@ -19,10 +19,21 @@ description: |
 provider: claude
 model: medium
 
-# Isolation is left to the caller (Archon default = worktree for task/issue/pr).
-# Running inside a worktree keeps BMAD's mutations to sprint-status.yaml, story files,
-# and source isolated on a branch until you review and merge. Pass --no-worktree to the
-# CLI to run in the live checkout instead.
+# Isolation: this workflow ALWAYS runs in the live checkout (no Archon worktree).
+# BMAD gitignores `_bmad/` (its config + the scripts the skills execute), `.claude/`
+# (the BMAD skills themselves), and usually the output folder with sprint-status.yaml and
+# story files. An Archon worktree is a fresh checkout of TRACKED files only, so all of that
+# is absent there and both the `init` guard and the BMAD skills fail. Declaring
+# worktree.enabled:false pins the run to the live checkout, so no --no-worktree flag is
+# needed (and --branch/--from are rejected with a clear error).
+#
+# For isolation, create your own throwaway branch first, then run:
+#   git checkout -b bmad/epic-2
+#   archon workflow run archon-bmad-story-automator "epic 2"
+# Review the per-story commits, then merge or `git branch -D` to discard.
+worktree:
+  enabled: false       # always run in the live checkout; BMAD's inputs are gitignored
+mutates_checkout: true # writes story files, sprint-status, and commits into the checkout
 
 nodes:
   # ─── Phase 0: Resolve the BMAD project + initialize run state ─────────
@@ -211,7 +222,7 @@ nodes:
 
         ## phase = "commit"
         Commit the verified work (absolute path, no `cd`):
-          `git -C {root} add -A && git -C {root} commit -m "feat({currentStory}): implement via bmad-implement" || true`
+          `git -C {root} add -A && git -C {root} commit -m "feat({currentStory}): implement via archon-bmad-story-automator" || true`
         Then advance:
         - Append `{currentStory}` to `completedStories`. Set `currentStory = null`, `reviewRetry = 0`.
         - Re-read sprint-status: are ALL stories in `{currentEpic}` now `done`?

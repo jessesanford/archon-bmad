@@ -11,7 +11,7 @@ Derived from:
   Copyright (c) 2026 BMAD — MIT License
 
 The adversarial code-review instructions inlined in
-`workflows/bmad-implement.yaml` (the `review` phase) are a paraphrased
+`workflows/archon-bmad-story-automator.yaml` (the `review` phase) are a paraphrased
 derivative of the bundled `bmad-story-automator-review` skill from that
 project. The per-story pipeline ordering (create -> dev -> auto -> review ->
 commit, with per-epic retrospectives) and the "sprint-status.yaml is the

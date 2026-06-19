@@ -1,19 +1,72 @@
 # archon-bmad
 
-**Automate the BMAD implementation loop as a native [Archon](https://archon.diy) workflow.**
+**A collection of [BMAD-METHOD](https://github.com/bmad-code-org/BMAD-METHOD) workflows for the
+[Archon](https://archon.diy) workflow engine.**
 
-This is a port of the [`bmad-story-automator`](https://github.com/bmad-code-org/bmad-automator)
-onto the Archon workflow engine. After you've finished BMAD planning (PRD, architecture, sprint
-plan) and `sprint-status.yaml` exists, drop this workflow into your Archon install and let Archon
-drive the whole implementation cycle — story by story, with an adversarial review gate and per-epic
-retrospectives — using **your existing BMAD skills**.
+This repository is a home for native Archon workflows that automate parts of the BMAD method. Each
+workflow is a self-contained `*.yaml` file in [`workflows/`](./workflows) that runs locally, in chat,
+on the web UI, or in an isolated git worktree — no tmux, no Python helper, no separate orchestrator
+process. Install them all at once and run whichever one you need.
 
-No tmux. No Python helper. No separate orchestrator process. Just one Archon workflow that runs
-locally, in chat, on the web UI, or in an isolated git worktree.
+The collection grows over time. The first workflow,
+[`archon-bmad-story-automator`](#archon-bmad-story-automator), automates the BMAD *implementation*
+loop; future workflows will cover other parts of the method (planning, review, release, and so on).
 
 ---
 
-## What it does
+## Install
+
+`./install.sh` copies **every** workflow in [`workflows/`](./workflows) into your Archon workflows
+directory — so a single install gives you the whole collection, and re-running it picks up any
+workflows added later.
+
+**Global (every project on your machine):**
+
+```bash
+./install.sh
+# copies workflows/*.yaml -> ~/.archon/workflows/
+```
+
+**A specific repo:**
+
+```bash
+./install.sh /path/to/your-bmad-project/.archon/workflows
+```
+
+**Manual:**
+
+```bash
+mkdir -p ~/.archon/workflows
+cp workflows/*.yaml ~/.archon/workflows/
+```
+
+Respects `ARCHON_HOME`. Verify the collection is discoverable (every workflow here is named
+`archon-bmad-*`):
+
+```bash
+archon workflow list | grep archon-bmad
+```
+
+---
+
+## Workflows
+
+| Workflow                                                | Automates                                                                 |
+| ------------------------------------------------------- | ------------------------------------------------------------------------- |
+| [`archon-bmad-story-automator`](#archon-bmad-story-automator) | The BMAD implementation loop — create → dev → review → commit per story, with per-epic retrospectives. |
+
+_More workflows will be added here over time._
+
+---
+
+### archon-bmad-story-automator
+
+A port of the [`bmad-story-automator`](https://github.com/bmad-code-org/bmad-automator) onto the
+Archon workflow engine. After you've finished BMAD planning (PRD, architecture, sprint plan) and
+`sprint-status.yaml` exists, this workflow drives the whole implementation cycle — story by story,
+with an adversarial review gate and per-epic retrospectives — using **your existing BMAD skills**.
+
+#### What it does
 
 For each selected story it plays one role per loop iteration, verifying against the real
 `sprint-status.yaml` after every step (never trusting a session that merely "looks done"):
@@ -30,7 +83,7 @@ For each selected story it plays one role per loop iteration, verifying against 
 When everything in your selection is `done` and each completed epic has had its retrospective, the
 run finishes and emits a report.
 
-## Requirements
+#### Requirements
 
 - **Archon** installed (`archon` CLI or the web UI). See https://archon.diy.
 - A **BMAD-METHOD project** with planning complete — i.e. `_bmad/bmm/config.yaml` and
@@ -45,71 +98,54 @@ run finishes and emits a report.
 The workflow defaults to the `claude` provider so the BMAD skills are auto-discovered. It works with
 any project BMAD targets (the workflow itself is project-agnostic).
 
-## Install
+#### Usage
 
-Pick one:
-
-**Global (every project on your machine):**
-
-```bash
-./install.sh
-# copies workflows/bmad-implement.yaml -> ~/.archon/workflows/
-```
-
-**A specific repo:**
-
-```bash
-./install.sh /path/to/your-bmad-project/.archon/workflows
-```
-
-**Manual:**
-
-```bash
-mkdir -p ~/.archon/workflows
-cp workflows/bmad-implement.yaml ~/.archon/workflows/
-```
-
-Respects `ARCHON_HOME`. Verify it's discoverable:
-
-```bash
-archon workflow list | grep bmad-implement
-```
-
-## Usage
-
-Run from the **root of your BMAD project**:
+Run from the **root of your BMAD project** (no isolation flags needed — see
+[Isolation](#isolation) for why):
 
 ```bash
 # Implement a whole epic
-archon workflow run bmad-implement "epic 2"
+archon workflow run archon-bmad-story-automator "epic 2"
 
 # Implement specific stories
-archon workflow run bmad-implement "stories 2-1 through 2-4"
+archon workflow run archon-bmad-story-automator "stories 2-1 through 2-4"
 
 # Implement everything still pending in sprint-status
-archon workflow run bmad-implement "all pending stories"
-
-# Run in the live checkout instead of an isolated worktree
-archon workflow run bmad-implement --no-worktree "epic 2"
+archon workflow run archon-bmad-story-automator "all pending stories"
 
 # Kick it off detached and watch it
-archon workflow run bmad-implement "epic 2" --detach
+archon workflow run archon-bmad-story-automator "epic 2" --detach
 archon workflow runs
 ```
 
-You can also launch it from Archon chat ("run bmad-implement for epic 2") or the web UI. The free-text
-argument is interpreted by the loop's `select` phase against `sprint-status.yaml`, so natural phrasing
-("epic 2", "the auth stories", "everything left") works.
+You can also launch it from Archon chat ("run archon-bmad-story-automator for epic 2") or the web UI.
+The free-text argument is interpreted by the loop's `select` phase against `sprint-status.yaml`, so
+natural phrasing ("epic 2", "the auth stories", "everything left") works.
 
-### Isolation
+#### Isolation
 
-By default Archon runs the workflow in a **git worktree** on a fresh branch, so BMAD's mutations to
-`sprint-status.yaml`, story files, and source stay isolated until you review and merge. Pass
-`--no-worktree` to run in the live checkout. The final report tells you which branch to review.
+This workflow **always runs in your live checkout** — it declares `worktree.enabled: false`, so
+Archon never creates a worktree and you never need a `--no-worktree` flag (passing `--branch` or
+`--from` is rejected with a clear error).
 
-## Configuration knobs
+Why it has to: Archon's default worktree is a fresh checkout of *tracked* files only, but BMAD
+gitignores everything this workflow depends on — `_bmad/` (its config and the Python scripts the
+skills execute), `.claude/` (the BMAD skills themselves), and usually the output folder holding
+`sprint-status.yaml` and the story files. In a worktree all of that is absent, so both the `init`
+guard and the BMAD skills fail. The live checkout is the only place they all exist together.
 
-Edit `workflows/bmad-implement.yaml` to taste:
+The per-story commits land on **your current branch**. To get isolation, make your own throwaway
+branch before running and review it afterward:
+
+```bash
+git checkout -b bmad/epic-2
+archon workflow run archon-bmad-story-automator "epic 2"
+# review the commits, then merge — or `git branch -D bmad/epic-2` to discard
+```
+
+#### Configuration knobs
+
+Edit `workflows/archon-bmad-story-automator.yaml` to taste:
 
 - `model:` — workflow default is `medium`; the heavy `build-loop` node is pinned to `large` because
   under-powering the dev/review work is the main reason naive automation produces slop. Lower it (or
@@ -118,7 +154,7 @@ Edit `workflows/bmad-implement.yaml` to taste:
 - `build-loop.idle_timeout` (default `1800000` ms = 30 min) — raise if `dev-story` sessions run long.
 - `build-loop.loop.until` / retry counts (`maxReviewRetries`, `maxCreateRetries`) — tune the gates.
 
-## How it differs from the upstream automator
+#### How it differs from the upstream automator
 
 This is a faithful port of the *pipeline*, deliberately simplified for the Archon runtime:
 
@@ -135,8 +171,18 @@ Everything else — the `create → dev → auto → review(≤5) → commit` pe
 "0 CRITICAL issues" completion gate, sprint-status as source of truth, and per-epic retrospectives
 fired inside the loop — matches the automator.
 
+---
+
+## Adding a workflow
+
+1. Drop a new `*.yaml` Archon workflow into [`workflows/`](./workflows) with a descriptive `name:`.
+   Keep it prefixed `archon-bmad-` so it's easy to find with `archon workflow list | grep archon-bmad`.
+2. Add a row to the [Workflows](#workflows) table and a `###` section documenting it.
+3. `./install.sh` picks it up automatically — no installer changes needed.
+
 ## Credits & license
 
-Ported from [`bmad-code-org/bmad-automator`](https://github.com/bmad-code-org/bmad-automator)
-and built for the [BMAD-METHOD](https://github.com/bmad-code-org/BMAD-METHOD). Both are MIT-licensed;
-see [`NOTICE`](./NOTICE) for attribution. This repository is MIT-licensed — see [`LICENSE`](./LICENSE).
+`archon-bmad-story-automator` is ported from
+[`bmad-code-org/bmad-automator`](https://github.com/bmad-code-org/bmad-automator) and built for the
+[BMAD-METHOD](https://github.com/bmad-code-org/BMAD-METHOD). Both are MIT-licensed; see
+[`NOTICE`](./NOTICE) for attribution. This repository is MIT-licensed — see [`LICENSE`](./LICENSE).
