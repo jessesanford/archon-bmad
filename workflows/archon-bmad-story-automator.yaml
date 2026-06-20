@@ -160,6 +160,13 @@ nodes:
 
         Always use ABSOLUTE paths. Do not `cd` away from `root` for verification steps.
 
+        COMMITS — only the `commit` phase ever runs `git commit`. In EVERY other phase (create, dev,
+        auto, review) make your file changes but leave them UNCOMMITTED in the working tree. This is
+        what lets each story land as ONE atomic commit — implementation, review fixes, the story file
+        (`Status: done`), and the sprint-status `done` flip together — with no manual follow-up commit.
+        Never add AI attribution to any commit: no `Co-Authored-By:` trailer, no "Generated with
+        Claude Code" line, no similar credit. Commits carry only the repo's configured git user.
+
         ---
 
         ## phase = "select"  — pick the next unit of work
@@ -229,8 +236,27 @@ nodes:
         Update `state.json`. End turn.
 
         ## phase = "commit"
-        Commit the verified work (absolute path, no `cd`):
-          `git -C {root} add -A && git -C {root} commit -m "feat({currentStory}): implement via archon-bmad-story-automator" || true`
+        This is the ONLY place the story's work is committed. Produce ONE atomic commit that already
+        contains the `done` state, so no manual follow-up commit is ever needed.
+
+        1. RE-ASSERT completion immediately before staging (a fresh-context earlier phase may have
+           left sprint-status in a non-final state):
+           - Re-read sprint-status.yaml. If `development_status[{currentStory}]` is anything other
+             than `done`, set it to `done` now (preserve all comments and structure).
+           - Ensure the story file for `{currentStory}` has `Status: done`.
+        2. Stage everything, then commit once (absolute paths, no `cd`):
+             `git -C {root} add -A`
+           If `git -C {root} status --porcelain` is empty, skip the commit (nothing to do).
+           Otherwise commit with a descriptive Conventional Commits message you write from the story —
+           subject `feat({currentStory}): <concise summary>`, plus a short body of the key changes and
+           the test result:
+             `git -C {root} commit -F <message-file> || true`
+           The commit message must contain NO AI attribution — do NOT add a `Co-Authored-By:` trailer
+           (Claude or otherwise), a "Generated with Claude Code" line, or any similar credit. Author
+           and committer stay as the repo's configured git user only.
+           The single commit MUST contain, together: the implementation, any review fixes, the updated
+           story file (`Status: done`), AND sprint-status.yaml (`development_status[{currentStory}] =
+           done`). Never split the `done` flip into a separate commit.
         Then advance:
         - Append `{currentStory}` to `completedStories`. Set `currentStory = null`, `reviewRetry = 0`.
         - Re-read sprint-status: are ALL stories in `{currentEpic}` now `done`?
