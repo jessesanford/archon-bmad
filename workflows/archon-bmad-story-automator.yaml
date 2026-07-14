@@ -296,10 +296,12 @@ nodes:
         inlined `review` phase, which does not go through a BMAD skill's own activation steps)
         sees it, not just `create`/`dev`:
         - Every story gets its own branch: `feat/{epicSlug}/story-{epic}.{story}`.
-        - The first story in an epic branches off the repo's real default branch
-          (`bmad-env.json` → `defaultBranch`). Every later story in that epic branches off the
-          **previous story's own branch**, not off `defaultBranch` again — that's what makes it a
-          stack.
+        - Every later story branches off the **previous story's own branch**, never off
+          `defaultBranch` again — that's what makes it a stack. This chaining crosses epic
+          boundaries too: the first story of a new epic branches off the LAST story branch of the
+          previous epic (not off `defaultBranch`), so the whole repo's story history forms one
+          continuous stack. `defaultBranch` (`bmad-env.json` → `defaultBranch`) is only ever the
+          parent for the very first story of the very first epic ever worked in this repo.
         - Every story's branch gets its own PR: `base = ` the branch it stacked on.
         - This is implemented by a new `branch` phase (runs right before `create`/`dev` for a
           newly-selected story) and an extra push+PR step inside `commit` — both below. If
@@ -315,8 +317,10 @@ nodes:
           - Set `currentStory` = its story key (e.g. `"2-3-user-auth"`), `reviewRetry` = 0, `createRetry` = 0.
           - If its epic number differs from the current `currentEpic`, this is a NEW epic starting:
             reset `epicSlug`, `currentStoryBranch`, `parentStoryBranch` to `null` (a new epic
-            re-derives its own slug and starts its own stack fresh off `defaultBranch` — it never
-            stacks on the previous epic's last branch). Set `currentEpic` = its epic number.
+            re-derives its own slug, but its FIRST story still stacks on the previous epic's LAST
+            story branch — see the `branch` phase's parent-resolution logic below; a new epic never
+            resets back to `defaultBranch` unless no prior epic has any branches at all). Set
+            `currentEpic` = its epic number.
           - If `stackedBranching` is `true`: set `phase = "branch"` (that phase decides `create` vs
             `dev` itself once the branch switch is done).
           - Else (legacy behavior, `stackedBranching` is `false`): if a story file matching that
@@ -337,7 +341,10 @@ nodes:
         ## phase = "branch"  — create/checkout this story's own branch, stacked on the previous one
         Only reached when `stackedBranching` is `true` (see "Repo branching convention" above).
         Never accumulate multiple stories on one branch — every story gets its own branch, chained
-        as a stack, off the previous story's branch (or `defaultBranch` for an epic's first story).
+        as a stack, off the previous story's branch — including across epic boundaries: an epic's
+        first story stacks on the PREVIOUS epic's last story branch, not on `defaultBranch` (see
+        step 3). `defaultBranch` is only ever the parent for the very first story of the very
+        first epic ever worked in this repo.
 
         1. Resolve `epicSlug` if it is still `null` in `state.json` (cache it once resolved for
            `{currentEpic}` — do not re-derive on every later iteration of the same epic):
@@ -357,9 +364,15 @@ nodes:
            - `git -C {root} branch -a --list 'feat/{epicSlug}/story-{currentEpic}.*'` — if any
              match with a story number LOWER than this story's, the parent is the one with the
              HIGHEST such number (the immediately-preceding story in the stack).
-           - Else (this is the first story of this epic), the parent is `defaultBranch` from
-             `bmad-env.json` — NOT this run's own worktree `workBranch`, and NOT necessarily
-             whatever `baseBranch` the live checkout happened to be on when the run started.
+           - Else, this is the first story of this epic. The parent is **the last story branch of
+             the previous epic** — every epic's stack chains onto the end of the one before it, it
+             never resets back to `defaultBranch` just because the epic number changed:
+             `git -C {root} branch -a --list 'feat/*/story-*'` — from all matches with an epic
+             number LOWER than `{currentEpic}`, take the one with the HIGHEST epic number, then
+             (within that epic) the HIGHEST story number. That is the parent.
+           - Only if that search finds NO branches at all (this is genuinely the very first story of
+             the very first epic ever worked in this repo) does the parent fall back to
+             `defaultBranch` from `bmad-env.json`.
            - Record it as `parentStoryBranch` in `state.json`.
         4. Safety stash: `git -C {root} status --porcelain` — if this shows ANY uncommitted
            changes (should not happen in normal operation, since `commit` always leaves a clean
@@ -508,9 +521,10 @@ nodes:
            - Manual fallback (also the only path when `ghAvailable` is `true` but `ghStackAvailable`
              is `false`, or `gh stack` genuinely doesn't work on this host): create explicitly against
              the resolved repo and the resolved parent branch — never omit `--base`, and never
-             substitute `defaultBranch`/`main` for `{parentStoryBranch}` unless this really is the
-             first story of the epic (`parentStoryBranch == defaultBranch` in that case, which is
-             correct, not a fallback):
+             substitute `defaultBranch`/`main` for `{parentStoryBranch}` (per the branching
+             convention, `{parentStoryBranch}` equals `defaultBranch` only for the very first story
+             of the very first epic ever worked in this repo — every other story, including an
+             epic's first, stacks on an actual prior story branch):
              `gh pr create --repo <owner>/<repo> --base {parentStoryBranch} --head
              {currentStoryBranch} --title "<story title from the story file>" --body "<short summary
              + link to the story file path>"`.

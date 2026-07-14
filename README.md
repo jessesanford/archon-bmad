@@ -234,10 +234,12 @@ adapts, with zero configuration:
   story. Branch name: `feat/<epic-slug>/story-<epic>.<story>`. The epic slug is resolved once per epic
   (reused from an existing `feat/*/story-<epic>.*` branch if the epic's stack is already underway, else
   derived from the most-recently-modified `<output_folder>/specs/spec-*` folder name, else from
-  `project_name` in `_bmad/bmm/config.yaml`). The **first** story of an epic branches off the repo's
-  real default branch (`origin/HEAD` / `origin/main`, resolved separately from this run's own worktree
-  branch); every **later** story in that epic branches off the **previous story's own branch** — that's
-  the "stack." Any stray uncommitted changes are safety-stashed before switching.
+  `project_name` in `_bmad/bmm/config.yaml`). Every story branches off the **previous story's own
+  branch** — that's the "stack" — and this chaining crosses epic boundaries: an epic's **first** story
+  branches off the **previous epic's last story branch**, not off the repo's default branch. The repo's
+  real default branch (`origin/HEAD` / `origin/main`) is only ever the parent for the very first story
+  of the very first epic ever worked in the repo. Any stray uncommitted changes are safety-stashed
+  before switching.
 - **Push + PR (extended `commit` phase).** After the atomic commit, the story's branch is pushed to
   `origin` and its PR is opened with `--base` set to the branch it stacked on — via `gh stack submit` if
   the [`gh-stack`](https://github.github.com/gh-stack/) `gh` extension is installed, else a plain
