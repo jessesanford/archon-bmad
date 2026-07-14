@@ -311,6 +311,27 @@ nodes:
         ---
 
         ## phase = "select"  — pick the next unit of work
+        0. **Sync the worktree to the real stack tip FIRST, before trusting anything on disk** — this
+           step is not optional and must run every time `select` is entered, even if it looks like a
+           no-op. Archon creates this run's worktree off the repo's `defaultBranch`, and
+           `implementation-artifacts/sprint-status.yaml` is a normal tracked file — so on a fresh
+           worktree it holds whatever `defaultBranch` has, which is stale/behind once any story work
+           exists only on un-merged stacked branches (nothing gets merged to `defaultBranch` by this
+           workflow; every story stays on its own branch/PR). Scanning that stale copy makes already-
+           `done` stories look like `backlog` again and would re-do finished work from scratch. Only
+           skip this sync when `stackedBranching` is `false` (no stacked branches exist to sync from).
+           - `git -C {root} branch -a --list 'feat/*/story-*'` — if this returns nothing, there is no
+             stack yet (first-ever run in this repo); proceed with whatever `sprint-status.yaml` the
+             worktree already has.
+           - Else, resolve the stack tip using the exact same rule as the `branch` phase's parent
+             resolution: take the HIGHEST epic number present among those branches, then within that
+             epic the HIGHEST story number. That branch is the current tip of all completed work.
+           - If `{root}` is not already checked out on that tip branch: safety-stash any uncommitted
+             changes first (see the `branch` phase's step 4 for the exact stash invocation and
+             rationale), then `git -C {root} fetch origin {tipBranch}` (best-effort, ignore failure)
+             and `git -C {root} checkout {tipBranch}`.
+           - Re-read `sprint-status.yaml` from disk now that it reflects the tip branch's real state —
+             everything below in this phase must use THIS copy, not any earlier read.
         - Resolve the user's selection into target stories/epics. "all"/empty = all not-`done` stories.
         - Scan `development_status` in sprint order for the FIRST target story whose status is NOT `done`.
         - If a target story is found:
