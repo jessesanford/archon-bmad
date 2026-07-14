@@ -127,6 +127,42 @@ nodes:
         fi
       done
 
+      # ─── Per-story branch + stacked-PR convention detection ──────────────────────
+      # If the project has adopted a repo-wide "one branch + one PR per story, stacked"
+      # rule (e.g. via .agents/rules/story-branching-stacked-prs.mdc, projected to
+      # .cursor/rules/ or elsewhere), this workflow switches into stacked-branching mode:
+      # a new "branch" phase creates/checks out each story's own branch before create/dev,
+      # and the "commit" phase pushes + opens a stacked PR. Repos WITHOUT this rule keep
+      # the original single-worktree-branch behavior unchanged (STACKED_BRANCHING=false).
+      RULE_FILE=""
+      for rf in "$ROOT/.agents/rules/story-branching-stacked-prs.mdc" \
+                "$ROOT/.cursor/rules/story-branching-stacked-prs.mdc" \
+                "$ROOT/.claude/rules/story-branching-stacked-prs.mdc"; do
+        if [ -f "$rf" ] || [ -L "$rf" ]; then RULE_FILE="$rf"; break; fi
+      done
+      STACKED_BRANCHING=false
+      if [ -n "$RULE_FILE" ]; then
+        STACKED_BRANCHING=true
+        # Resolve through a symlink projection (e.g. .cursor/rules/... -> ../../.agents/rules/...)
+        # so the loop prompt always gets the real content, not a dangling/relative link path.
+        cp -L "$RULE_FILE" "$ART/branching-rule.md" 2>/dev/null || true
+      fi
+
+      # The repo's real default/integration branch (origin/HEAD, else origin/main, else
+      # "main") -- distinct from this RUN's own worktree branch and from whatever branch
+      # the live checkout happened to be on. This is what the FIRST story of a NEW epic
+      # stacks on; every later story in that epic stacks on the previous story's branch.
+      DEFAULT_BRANCH="$(git -C "$ROOT" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')"
+      [ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH="main"
+
+      # gh / gh-stack availability -- best-effort PR automation only; never required.
+      GH_AVAILABLE=false
+      command -v gh >/dev/null 2>&1 && GH_AVAILABLE=true
+      GH_STACK_AVAILABLE=false
+      if [ "$GH_AVAILABLE" = true ]; then
+        gh extension list 2>/dev/null | grep -qi 'github/gh-stack' && GH_STACK_AVAILABLE=true
+      fi
+
       # ─── Worktree branch (for the final report's integration instructions) ──────────
       # Archon runs each workflow in its own worktree on a branch it names automatically
       # (`archon/task-<workflow>-<timestamp>`), based off the repo's default branch — origin/HEAD,
@@ -162,7 +198,11 @@ nodes:
         "mainRoot": "$MAIN_ROOT",
         "inWorktree": $IN_WORKTREE,
         "workBranch": "$WORK_BRANCH",
-        "baseBranch": "$BASE_BRANCH"
+        "baseBranch": "$BASE_BRANCH",
+        "stackedBranching": $STACKED_BRANCHING,
+        "defaultBranch": "$DEFAULT_BRANCH",
+        "ghAvailable": $GH_AVAILABLE,
+        "ghStackAvailable": $GH_STACK_AVAILABLE
       }
       EOF
 
@@ -171,6 +211,9 @@ nodes:
         "phase": "select",
         "currentStory": null,
         "currentEpic": null,
+        "epicSlug": null,
+        "currentStoryBranch": null,
+        "parentStoryBranch": null,
         "reviewRetry": 0,
         "maxReviewRetries": 8,
         "createRetry": 0,
@@ -184,9 +227,12 @@ nodes:
       EOF
 
       echo "BMAD env resolved."
-      echo "  sprint-status:  $SPRINT"
-      echo "  artifacts dir:  $IMPL"
-      echo "  skipAutomate:   $SKIP_AUTOMATE"
+      echo "  sprint-status:     $SPRINT"
+      echo "  artifacts dir:     $IMPL"
+      echo "  skipAutomate:      $SKIP_AUTOMATE"
+      echo "  stackedBranching:  $STACKED_BRANCHING (rule: ${RULE_FILE:-none found})"
+      echo "  defaultBranch:     $DEFAULT_BRANCH"
+      echo "  gh/gh-stack:       gh=$GH_AVAILABLE gh-stack=$GH_STACK_AVAILABLE"
     timeout: 30000
 
   # ─── Phase 1: The implementation loop ────────────────────────────────
@@ -221,8 +267,8 @@ nodes:
         not yet `done`.)
 
         ## FIRST — load your state (every iteration)
-        1. Read `$ARTIFACTS_DIR/bmad-env.json` → `{ root, outputFolder, implementationArtifacts, sprintStatus, skipAutomate }`.
-        2. Read `$ARTIFACTS_DIR/state.json` → `{ phase, currentStory, currentEpic, reviewRetry, maxReviewRetries, createRetry, maxCreateRetries, status, ... }`.
+        1. Read `$ARTIFACTS_DIR/bmad-env.json` → `{ root, outputFolder, implementationArtifacts, sprintStatus, skipAutomate, stackedBranching, defaultBranch, ghAvailable, ghStackAvailable }`.
+        2. Read `$ARTIFACTS_DIR/state.json` → `{ phase, currentStory, currentEpic, epicSlug, currentStoryBranch, parentStoryBranch, reviewRetry, maxReviewRetries, createRetry, maxCreateRetries, status, ... }`.
         3. Read the sprint-status file at `sprintStatus`. Its `development_status` map is the
            SOURCE OF TRUTH for which stories are `done` / `in-progress` / `backlog`.
 
@@ -242,18 +288,90 @@ nodes:
         Never add AI attribution to any commit: no `Co-Authored-By:` trailer, no "Generated with
         Claude Code" line, no similar credit. Commits carry only the repo's configured git user.
 
+        ## Repo branching convention — read this before "select" routes you anywhere
+        If `bmad-env.json` → `stackedBranching` is `true`, this repo has adopted a "one branch +
+        one PR per story, chained as a stack" convention (never one long-lived branch carrying
+        multiple stories). The full rule — read `$ARTIFACTS_DIR/branching-rule.md` if present, it
+        is the repo's own canonical copy — is summarized here so every phase (including the
+        inlined `review` phase, which does not go through a BMAD skill's own activation steps)
+        sees it, not just `create`/`dev`:
+        - Every story gets its own branch: `feat/{epicSlug}/story-{epic}.{story}`.
+        - The first story in an epic branches off the repo's real default branch
+          (`bmad-env.json` → `defaultBranch`). Every later story in that epic branches off the
+          **previous story's own branch**, not off `defaultBranch` again — that's what makes it a
+          stack.
+        - Every story's branch gets its own PR: `base = ` the branch it stacked on.
+        - This is implemented by a new `branch` phase (runs right before `create`/`dev` for a
+          newly-selected story) and an extra push+PR step inside `commit` — both below. If
+          `stackedBranching` is `false`, skip both entirely; behavior is unchanged from before this
+          convention existed (single run-wide worktree branch, no PR automation).
+
         ---
 
         ## phase = "select"  — pick the next unit of work
         - Resolve the user's selection into target stories/epics. "all"/empty = all not-`done` stories.
         - Scan `development_status` in sprint order for the FIRST target story whose status is NOT `done`.
         - If a target story is found:
-          - Set `currentStory` = its story key (e.g. `"2-3-user-auth"`), `currentEpic` = its epic number, `reviewRetry` = 0, `createRetry` = 0.
-          - If a story file matching that key already exists in `implementationArtifacts`, set `phase = "dev"`; otherwise `phase = "create"`.
+          - Set `currentStory` = its story key (e.g. `"2-3-user-auth"`), `reviewRetry` = 0, `createRetry` = 0.
+          - If its epic number differs from the current `currentEpic`, this is a NEW epic starting:
+            reset `epicSlug`, `currentStoryBranch`, `parentStoryBranch` to `null` (a new epic
+            re-derives its own slug and starts its own stack fresh off `defaultBranch` — it never
+            stacks on the previous epic's last branch). Set `currentEpic` = its epic number.
+          - If `stackedBranching` is `true`: set `phase = "branch"` (that phase decides `create` vs
+            `dev` itself once the branch switch is done).
+          - Else (legacy behavior, `stackedBranching` is `false`): if a story file matching that
+            key already exists in `implementationArtifacts`, set `phase = "dev"`; otherwise
+            `phase = "create"`.
         - Else if a fully-`done` target epic has NOT yet had a retrospective (not in `completedEpics`):
           - Set `currentEpic` = that epic, `phase = "retro"`.
         - Else (everything selected is done and all completed epics have retros):
           - Set `status = "complete"`, `phase = "done"`.
+        Update `state.json`. End turn.
+
+        ## phase = "branch"  — create/checkout this story's own branch, stacked on the previous one
+        Only reached when `stackedBranching` is `true` (see "Repo branching convention" above).
+        Never accumulate multiple stories on one branch — every story gets its own branch, chained
+        as a stack, off the previous story's branch (or `defaultBranch` for an epic's first story).
+
+        1. Resolve `epicSlug` if it is still `null` in `state.json` (cache it once resolved for
+           `{currentEpic}` — do not re-derive on every later iteration of the same epic):
+           - `git -C {root} branch -a --list 'feat/*/story-{currentEpic}.*'` — if any match, reuse
+             the exact slug between `feat/` and `/story-` from the first one (this is how an
+             in-progress epic's stack is resumed with the SAME slug it already used).
+           - Else, list `{outputFolder}/specs/spec-*` (if that directory exists) and use the
+             most-recently-modified entry's name with the `spec-` prefix stripped, kebab-cased.
+           - Else, fall back to `project_name` from `_bmad/bmm/config.yaml`, kebab-cased.
+           - Record the resolved value as `epicSlug` in `state.json`.
+        2. Compute this story's branch name: `feat/{epicSlug}/story-{epic}.{story}` (dot-separated
+           — confirm the exact format against any branches `git -C {root} branch -a` already shows
+           for this repo before assuming; dot-separated `story-1.4` is this repo's own precedent,
+           but do not hardcode it blindly against a repo with a different existing convention).
+        3. Resolve `parentStoryBranch` (what this story's branch stacks on) fresh every time — do
+           not trust a value cached from a previous epic:
+           - `git -C {root} branch -a --list 'feat/{epicSlug}/story-{currentEpic}.*'` — if any
+             match with a story number LOWER than this story's, the parent is the one with the
+             HIGHEST such number (the immediately-preceding story in the stack).
+           - Else (this is the first story of this epic), the parent is `defaultBranch` from
+             `bmad-env.json` — NOT this run's own worktree `workBranch`, and NOT necessarily
+             whatever `baseBranch` the live checkout happened to be on when the run started.
+           - Record it as `parentStoryBranch` in `state.json`.
+        4. Safety stash: `git -C {root} status --porcelain` — if this shows ANY uncommitted
+           changes (should not happen in normal operation, since `commit` always leaves a clean
+           tree, but a retrospective's doc writes or an interrupted prior run could leave some),
+           stash them out first so they never bleed onto the new story's branch:
+           `git -C {root} stash push -u -m "archon-bmad: pre-branch safety stash ({currentStory})"`.
+           Note in your turn's summary that a stash was created so a human can review/pop it later
+           — this workflow does not auto-commit unrelated leftover changes.
+        5. Create/checkout this story's branch, idempotently (so a resumed/retried run that
+           already created it does not fail or recreate it):
+           - Best-effort `git -C {root} fetch origin {parentStoryBranch}` first (ignore failure —
+             the parent may be a local-only branch this same run just created).
+           - If `git -C {root} show-ref --verify --quiet refs/heads/{thisStoryBranch}` succeeds,
+             `git -C {root} checkout {thisStoryBranch}`.
+           - Else `git -C {root} checkout -b {thisStoryBranch} {parentStoryBranch}`.
+        6. Record `currentStoryBranch` = this story's branch name in `state.json`.
+        7. Set `phase` exactly as the legacy rule did: if a story file matching `{currentStory}`
+           already exists in `implementationArtifacts`, `phase = "dev"`; otherwise `phase = "create"`.
         Update `state.json`. End turn.
 
         ## phase = "create"  → bmad-create-story
@@ -347,6 +465,28 @@ nodes:
            The single commit MUST contain, together: the implementation, any review fixes, the updated
            story file (`Status: done`), AND sprint-status.yaml (`development_status[{currentStory}] =
            done`). Never split the `done` flip into a separate commit.
+        3. If `stackedBranching` is `true`, push this story's branch and open its stacked PR.
+           Best-effort only — a push/PR failure (auth, no remote, `gh` missing, offline) must NEVER
+           fail the story or the run; log a warning and continue to "Then advance" below regardless.
+           - Push: `git -C {root} push -u origin {currentStoryBranch}`.
+           - Resolve `owner/repo` from `git -C {root} remote get-url origin` for the `gh` calls below.
+           - Idempotency check first (a resumed/retried run may have already opened this story's PR):
+             `gh pr list --repo <owner>/<repo> --head {currentStoryBranch} --json number,url`. If a
+             PR already exists, skip straight to recording it (do not create a second one).
+           - Else, if `ghStackAvailable` is `true`, try the native path first:
+             `gh stack init {parentStoryBranch} {currentStoryBranch}` (best-effort, ignore failure —
+             the branches may already be adopted) then `gh stack submit`. If that reports the repo
+             does not support native stacked PRs (e.g. "Stacked PRs are not enabled for this
+             repository"), fall through to the manual command below instead of giving up.
+           - Manual fallback (also the only path when `ghAvailable` is `true` but `ghStackAvailable`
+             is `false`): `gh pr create --repo <owner>/<repo> --base {parentStoryBranch} --head
+             {currentStoryBranch} --title "<story title from the story file>" --body "<short summary
+             + link to the story file path>"`.
+           - If `ghAvailable` is `false`, skip PR creation entirely and just note in your turn's
+             summary that the branch was pushed (if it was) and a PR needs opening manually.
+           - Record whatever PR number/URL resulted (or that none could be created) — mention it in
+             your turn's summary so the final `report` node can surface it; do not create a second
+             commit just to persist this.
         Then advance:
         - Append `{currentStory}` to `completedStories`. Set `currentStory = null`, `reviewRetry = 0`.
         - Re-read sprint-status: are ALL stories in `{currentEpic}` now `done`?
@@ -389,8 +529,8 @@ nodes:
       Generate a concise run report for this BMAD implementation run.
 
       Read:
-      1. `$ARTIFACTS_DIR/state.json` — final status (`complete`/`failed`), completedStories, completedEpics, reason.
-      2. `$ARTIFACTS_DIR/bmad-env.json` — sprint-status path, and `mainRoot` / `inWorktree` / `workBranch` / `baseBranch`.
+      1. `$ARTIFACTS_DIR/state.json` — final status (`complete`/`failed`), completedStories, completedEpics, reason, `stackedBranching`, `epicSlug`.
+      2. `$ARTIFACTS_DIR/bmad-env.json` — sprint-status path, and `mainRoot` / `inWorktree` / `workBranch` / `baseBranch` / `stackedBranching` / `ghAvailable`.
       3. The sprint-status file (from bmad-env.json) — final per-story status.
       4. `git -C <root> log --oneline -30` — the commits this run produced (root = the worktree).
 
@@ -402,6 +542,23 @@ nodes:
       ### Epics & Retrospectives
       - Which epics completed and which had a retrospective run.
       ### Next steps
+      <check if="stackedBranching is true (from bmad-env.json), instead of the single-worktree-branch section below">
+      - This run used the repo's stacked-branch-per-story convention — no single `{workBranch}` holds
+        the work. Find each story's own branch and PR:
+          # list this epic's story branches (each one a separate, already-pushed stack rung):
+          `git -C <root> branch -a --list 'feat/{epicSlug}/story-*'`
+          # if gh is available, list the PRs actually opened this run:
+          `gh pr list --repo <owner>/<repo> --head <each-story-branch> --json number,url,baseRefName`
+        List each completed story's branch name, its base (the branch it stacked on), and its PR
+        URL/number if one exists (or "not opened — <reason>" if `ghAvailable` was false or PR
+        creation failed and was only logged). Note explicitly that these branches were pushed
+        directly to `origin` from the Archon worktree — nothing further to merge/integrate through
+        the worktree itself; the PRs are the integration path (review + merge each rung of the stack
+        in order, oldest story first). Still mention worktree teardown once all its PRs are merged:
+          `archon complete {workBranch}` (`--force` only if you intend to discard rather than keep
+          the now-merged branches around for reference).
+      </check>
+      <check if="stackedBranching is false/absent — the ORIGINAL single-branch behavior">
       - If `inWorktree` is true: this run happened in an isolated Archon worktree at `{root}`, on branch
         `{workBranch}`. Your live checkout was never touched (still on `{baseBranch}`), and Archon does
         NOT auto-merge or auto-remove the worktree — it persists until you integrate and tear it down.
@@ -421,6 +578,7 @@ nodes:
         or `archon isolation cleanup --merged` to bulk-clean already-merged runs later.
       - If `inWorktree` is false (ran with `--no-worktree`): commits landed on `{baseBranch}` in your
         live checkout directly — no merge or cleanup step needed.
+      </check>
       - Any stories left `in-progress` or `failed` that need a human.
 
       Write the report to `$ARTIFACTS_DIR/report.md` AND output it directly so the user sees it.

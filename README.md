@@ -73,11 +73,12 @@ For each selected story it plays one role per loop iteration, verifying against 
 
 | Phase    | BMAD skill invoked              | What happens                                                        |
 | -------- | ------------------------------- | ------------------------------------------------------------------ |
+| `branch` | —                                | *Only if the repo uses [stacked branching](#stacked-branching--pr-automation)* — checkout/create this story's own branch, stacked on the previous story's |
 | `create` | `bmad-create-story`             | Write the next story file (YOLO, autonomous)                       |
 | `dev`    | `bmad-dev-story`                | Implement all `[ ]` tasks, run tests, tick checkboxes              |
 | `auto`   | `bmad-qa-generate-e2e-tests`    | Optional — test-gen; **auto-skipped** if the skill isn't installed |
 | `review` | _inlined adversarial reviewer_  | Attack impl vs story claims + git reality; auto-fix; **gate = 0 CRITICAL & 0 HIGH**; loops ≤ 8 |
-| `commit` | —                               | `git commit` only after review verifies                            |
+| `commit` | —                               | `git commit` after review verifies; if stacked branching is on, also pushes and opens/updates this story's PR |
 | `retro`  | `bmad-retrospective`            | Fires per epic when every story in it is `done`; YOLO; non-blocking |
 
 When everything in your selection is `done` and each completed epic has had its retrospective, the
@@ -214,6 +215,42 @@ Re-enter the **same** worktree (inputs already hydrated) to do more:
 **Running in the live checkout instead.** Pass `--no-worktree` to skip worktrees and run directly in your
 live checkout (the copy step then no-ops — the gitignored inputs are already there). `--branch <name>` /
 `--from <ref>` control the worktree's branch and base point.
+
+#### Stacked branching & PR automation
+
+Some BMAD projects adopt a repo-wide convention of **one branch + one PR per story, chained as a
+stack**, instead of landing every story on one long branch — the standard "large PR is unreviewable"
+fix, using something like the [`gh-stack`](https://github.github.com/gh-stack/) extension or manual
+`gh pr create --base <previous-story-branch>`. This workflow **auto-detects** that convention and
+adapts, with zero configuration:
+
+- **Detection.** `init` looks for `.agents/rules/story-branching-stacked-prs.mdc` (or a
+  `.cursor/rules/`/`.claude/rules/` projection of it). If found, the run switches into stacked-branching
+  mode (`stackedBranching: true` in `bmad-env.json`) and copies the rule's full text into
+  `$ARTIFACTS_DIR/branching-rule.md` so every phase's prompt — including the inlined `review` phase,
+  which bypasses BMAD skills' own `persistent_facts` — sees it. Projects without that rule file see
+  **no change in behavior**: everything still lands on the single run-wide worktree branch as before.
+- **Per-story branch (new `branch` phase).** Runs right before `create`/`dev` for each newly-selected
+  story. Branch name: `feat/<epic-slug>/story-<epic>.<story>`. The epic slug is resolved once per epic
+  (reused from an existing `feat/*/story-<epic>.*` branch if the epic's stack is already underway, else
+  derived from the most-recently-modified `<output_folder>/specs/spec-*` folder name, else from
+  `project_name` in `_bmad/bmm/config.yaml`). The **first** story of an epic branches off the repo's
+  real default branch (`origin/HEAD` / `origin/main`, resolved separately from this run's own worktree
+  branch); every **later** story in that epic branches off the **previous story's own branch** — that's
+  the "stack." Any stray uncommitted changes are safety-stashed before switching.
+- **Push + PR (extended `commit` phase).** After the atomic commit, the story's branch is pushed to
+  `origin` and its PR is opened with `--base` set to the branch it stacked on — via `gh stack submit` if
+  the [`gh-stack`](https://github.github.com/gh-stack/) `gh` extension is installed, else a plain
+  `gh pr create --base <parent-branch>`. Both push and PR creation are **best-effort**: a missing/
+  unauthenticated `gh`, no network, or a repo without native stacked-PR support never fails the story —
+  it's logged and left for the final report and a human to finish. Re-running is idempotent (an existing
+  PR for that branch is detected and left alone rather than duplicated).
+- **Report.** When `stackedBranching` was on, the final `report` node lists each completed story's own
+  branch, what it's based on, and its PR URL/number (via `gh pr list`) instead of the single-branch
+  merge instructions.
+
+This requires no changes to the rule file's location or content beyond what your project already uses
+for [the convention itself](https://github.com/github/gh-stack) — the workflow only *reads* it.
 
 #### Configuration knobs
 
