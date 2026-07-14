@@ -322,9 +322,15 @@ nodes:
           - Else (legacy behavior, `stackedBranching` is `false`): if a story file matching that
             key already exists in `implementationArtifacts`, set `phase = "dev"`; otherwise
             `phase = "create"`.
-        - Else if a fully-`done` target epic has NOT yet had a retrospective (not in `completedEpics`):
-          - Set `currentEpic` = that epic, `phase = "retro"`.
-        - Else (everything selected is done and all completed epics have retros):
+        - Else, check for a pending retrospective. This check is INDEPENDENT of how narrowly the
+          original selection was scoped — even a single-story selection (e.g. "story 1.5") must still
+          trigger its epic's retrospective once that epic becomes fully done, because the retro fires
+          on epic completion, not on what the user happened to name as the target. Concretely: scan
+          `development_status` for ANY epic where every one of its stories is `done` AND the epic
+          itself is not already in `completedEpics` (prefer `currentEpic` first if it qualifies, since
+          that's almost always the epic that was just finished).
+          - If such an epic is found: set `currentEpic` = that epic, `phase = "retro"`.
+        - Else (no target story pending, and every fully-done epic already has a retrospective):
           - Set `status = "complete"`, `phase = "done"`.
         Update `state.json`. End turn.
 
@@ -466,24 +472,51 @@ nodes:
            story file (`Status: done`), AND sprint-status.yaml (`development_status[{currentStory}] =
            done`). Never split the `done` flip into a separate commit.
         3. If `stackedBranching` is `true`, push this story's branch and open its stacked PR.
-           Best-effort only — a push/PR failure (auth, no remote, `gh` missing, offline) must NEVER
-           fail the story or the run; log a warning and continue to "Then advance" below regardless.
+           Best-effort only in the sense that a genuine push/PR failure (`gh` missing, offline, no
+           permission) must NEVER fail the story or the run — log a warning and continue to "Then
+           advance" below regardless. It is NOT best-effort in the sense of accepting a wrong base:
+           getting the base branch wrong silently defeats the entire point of a stacked PR, so treat
+           a wrong-base PR as a bug to prevent, not an acceptable shortcut.
+
            - Push: `git -C {root} push -u origin {currentStoryBranch}`.
-           - Resolve `owner/repo` from `git -C {root} remote get-url origin` for the `gh` calls below.
+           - **Resolve `<owner>/<repo>` by parsing `git -C {root} remote get-url origin` yourself**
+             (strip the host and `.git` suffix from the URL to get `<owner>/<repo>`) and pass it
+             explicitly as `--repo <owner>/<repo>` to every `gh` call below. Do **not** rely on `gh`'s
+             own implicit repo resolution (bare `gh pr create`/`gh pr list` with no `--repo`, or
+             `gh api repos/:owner/:repo`) — when a repo has both an `origin` (your fork/working repo)
+             and an `upstream` remote configured, that implicit resolution can silently pick
+             `upstream` instead of `origin`, which then makes `parentStoryBranch` (which only exists
+             on `origin`) look like it doesn't exist on "the repo" at all. That false negative is
+             exactly the kind of bug that produces a PR silently opened against the wrong base — if a
+             remote-branch-existence check ever comes back negative, double check it was actually run
+             against `<owner>/<repo>` parsed from `origin`, not gh's default, before trusting a "not
+             found" result.
            - Idempotency check first (a resumed/retried run may have already opened this story's PR):
              `gh pr list --repo <owner>/<repo> --head {currentStoryBranch} --json number,url`. If a
-             PR already exists, skip straight to recording it (do not create a second one).
-           - Else, if `ghStackAvailable` is `true`, try the native path first:
-             `gh stack init {parentStoryBranch} {currentStoryBranch}` (best-effort, ignore failure —
-             the branches may already be adopted) then `gh stack submit`. If that reports the repo
-             does not support native stacked PRs (e.g. "Stacked PRs are not enabled for this
-             repository"), fall through to the manual command below instead of giving up.
+             PR already exists, skip straight to recording it (do not create a second one) — but if
+             its `baseRefName` is wrong (not `{parentStoryBranch}`), fix it with `gh pr edit
+             --repo <owner>/<repo> <number> --base {parentStoryBranch}` before moving on; do not leave
+             a known-wrong base in place just because *a* PR exists.
+           - Else, if `ghStackAvailable` is `true`, actually attempt the native path first — do not
+             skip straight to the manual fallback just because it seems simpler:
+             `gh stack init {parentStoryBranch} {currentStoryBranch}` (adopts both branches into a
+             stack; safe to re-run — ignore a failure that indicates they're already adopted) then
+             `gh stack submit --auto --open`. Only fall through to the manual command below if this
+             genuinely fails for a structural reason (e.g. the extension errors that stacked PRs
+             aren't enabled for this repo/host) — not merely because an earlier, wrongly-scoped
+             remote-branch check made `{parentStoryBranch}` look unavailable.
            - Manual fallback (also the only path when `ghAvailable` is `true` but `ghStackAvailable`
-             is `false`): `gh pr create --repo <owner>/<repo> --base {parentStoryBranch} --head
+             is `false`, or `gh stack` genuinely doesn't work on this host): create explicitly against
+             the resolved repo and the resolved parent branch — never omit `--base`, and never
+             substitute `defaultBranch`/`main` for `{parentStoryBranch}` unless this really is the
+             first story of the epic (`parentStoryBranch == defaultBranch` in that case, which is
+             correct, not a fallback):
+             `gh pr create --repo <owner>/<repo> --base {parentStoryBranch} --head
              {currentStoryBranch} --title "<story title from the story file>" --body "<short summary
              + link to the story file path>"`.
            - If `ghAvailable` is `false`, skip PR creation entirely and just note in your turn's
-             summary that the branch was pushed (if it was) and a PR needs opening manually.
+             summary that the branch was pushed (if it was) and a PR needs opening manually with
+             `--base {parentStoryBranch}`.
            - Record whatever PR number/URL resulted (or that none could be created) — mention it in
              your turn's summary so the final `report` node can surface it; do not create a second
              commit just to persist this.
@@ -508,6 +541,14 @@ nodes:
 
         This phase is NON-BLOCKING: if the retrospective errors for any reason, log it and continue —
         never fail the run for a retro. When done (or on error):
+        - **Commit the retrospective's own file writes now** — do not defer this to the `commit`
+          phase, which may never run again in this session (there may be no further story left to
+          trigger it). If `git -C {root} status --porcelain` is non-empty: `git -C {root} add -A`
+          then commit with subject `docs: Epic {currentEpic} retrospective` and a short body listing
+          the action items. If `stackedBranching` is `true`, best-effort push it to the current
+          branch (`git -C {root} push -u origin {currentStoryBranch}` if `{currentStoryBranch}` is
+          still set from the epic's last story) so the retro doc isn't left stranded only in the
+          local worktree.
         - Append `{currentEpic}` to `completedEpics`. Set `currentEpic = null`, `phase = "select"`.
         Update `state.json`. End turn.
 
