@@ -64,6 +64,34 @@ nodes:
       if [ -f "$ROOT/.git" ]; then
         IN_WORKTREE=true
         echo "Worktree run: hydrating gitignored BMAD inputs from $MAIN_ROOT"
+
+        # ─── Prune stale worktrees from PREVIOUS runs of this same workflow ──────────────
+        # Git refuses to check out a branch that's already checked out in another worktree
+        # (no error surfaced to the caller beyond a failed `git checkout`). Every run gets
+        # its own fresh worktree on its own disposable `archon/task-archon-bmad-story-automator-*`
+        # branch, but Archon never tears the old one down — so a leftover worktree from a prior
+        # completed run of THIS workflow can silently block a later run's `select`/`retro` phase
+        # from checking out the real stacked-branch tip (e.g. `feat/*/story-5.2`) to read/commit
+        # against it. That failure must never be worked around by reading/committing against
+        # whatever branch happens to be checked out locally instead — it must be prevented here,
+        # deterministically, before any phase gets a chance to hit it. Only worktrees matching
+        # this workflow's own disposable branch pattern are touched (never someone else's job),
+        # and only when clean (git's own `worktree remove` refuses a dirty one, so this is safe).
+        while IFS= read -r wt_path; do
+          [ -z "$wt_path" ] && continue
+          [ "$wt_path" = "$ROOT" ] && continue
+          wt_branch="$(git -C "$MAIN_ROOT" worktree list --porcelain | awk -v p="$wt_path" '
+            $1=="worktree" {cur=$2} $1=="branch" && cur==p {print $2}')"
+          case "$wt_branch" in
+            refs/heads/archon/task-archon-bmad-story-automator-*)
+              echo "Pruning stale worktree from a previous run: $wt_path ($wt_branch)"
+              git -C "$MAIN_ROOT" worktree remove "$wt_path" 2>&1 || \
+                echo "  (left in place — not clean or still in use; a later checkout may fail until it's removed manually)"
+              ;;
+          esac
+        done < <(git -C "$MAIN_ROOT" worktree list --porcelain | sed -n 's/^worktree //p')
+        git -C "$MAIN_ROOT" worktree prune 2>&1 || true
+
         for rel in _bmad .claude .agents .codex; do
           if [ -e "$MAIN_ROOT/$rel" ]; then
             mkdir -p "$ROOT/$rel"
@@ -330,6 +358,19 @@ nodes:
              changes first (see the `branch` phase's step 4 for the exact stash invocation and
              rationale), then `git -C {root} fetch origin {tipBranch}` (best-effort, ignore failure)
              and `git -C {root} checkout {tipBranch}`.
+           - **Fail-closed on checkout failure — never work around it.** Immediately confirm
+             success with `git -C {root} rev-parse --abbrev-ref HEAD` and compare it to
+             `{tipBranch}`. If the checkout failed (e.g. git refuses because that branch is
+             already checked out in a DIFFERENT worktree — `init` prunes this repo's own stale
+             worktrees from previous runs, but cannot touch a worktree from a genuinely
+             concurrent run or one from a different workflow), do **not** improvise a substitute
+             (reading the branch's content another way, committing on whatever happens to be
+             checked out, or otherwise proceeding as if the sync succeeded). Any commit made
+             without `{root}` actually being on `{tipBranch}` lands on the wrong branch and is
+             effectively lost. Instead: set `status = "error"`, record the conflicting worktree
+             path (from `git -C {root} worktree list`) and `{tipBranch}` in `state.json`'s
+             `reason`, update `state.json`, and end the turn — a human must resolve the
+             conflicting worktree before this run can safely continue.
            - Re-read `sprint-status.yaml` from disk now that it reflects the tip branch's real state —
              everything below in this phase must use THIS copy, not any earlier read.
         - Resolve the user's selection into target stories/epics. "all"/empty = all not-`done` stories.
@@ -596,14 +637,25 @@ nodes:
 
         This phase is NON-BLOCKING: if the retrospective errors for any reason, log it and continue —
         never fail the run for a retro. When done (or on error):
+        - **Verify `{root}` is actually on the epic's last story branch before committing anything.**
+          `git -C {root} rev-parse --abbrev-ref HEAD` must equal `{currentStoryBranch}` (the branch
+          this epic's final story landed on). If it does NOT match — e.g. `select`'s step 0 sync
+          silently failed earlier this run, or this phase was reached by a path that skipped that
+          sync — do **not** commit here: a commit made on the wrong branch (such as this run's own
+          disposable Archon task branch) strands the retro doc where the next run will never look
+          for it. Instead attempt the same sync as `select` step 0 once (fetch + checkout
+          `{currentStoryBranch}`); if it still doesn't match afterward, set `status = "error"` with
+          the mismatch (expected vs actual branch) in `state.json`'s `reason`, update `state.json`,
+          and end the turn rather than committing blind.
         - **Commit the retrospective's own file writes now** — do not defer this to the `commit`
           phase, which may never run again in this session (there may be no further story left to
           trigger it). If `git -C {root} status --porcelain` is non-empty: `git -C {root} add -A`
           then commit with subject `docs: Epic {currentEpic} retrospective` and a short body listing
-          the action items. If `stackedBranching` is `true`, best-effort push it to the current
-          branch (`git -C {root} push -u origin {currentStoryBranch}` if `{currentStoryBranch}` is
-          still set from the epic's last story) so the retro doc isn't left stranded only in the
-          local worktree.
+          the action items. If `stackedBranching` is `true`, push it to the current branch (`git -C
+          {root} push -u origin {currentStoryBranch}`) so the retro doc isn't left stranded only in
+          the local worktree — this is no longer best-effort/silently-ignorable: if the push fails,
+          log the exact error in `state.json`'s `reason` so a human can see the retro commit exists
+          locally but didn't reach `origin`.
         - Append `{currentEpic}` to `completedEpics`. Set `currentEpic = null`, `phase = "select"`.
         Update `state.json`. End turn.
 
