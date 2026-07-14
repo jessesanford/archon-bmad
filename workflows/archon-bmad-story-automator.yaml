@@ -350,10 +350,14 @@ nodes:
         - Else, check for a pending retrospective. This check is INDEPENDENT of how narrowly the
           original selection was scoped — even a single-story selection (e.g. "story 1.5") must still
           trigger its epic's retrospective once that epic becomes fully done, because the retro fires
-          on epic completion, not on what the user happened to name as the target. Concretely: scan
-          `development_status` for ANY epic where every one of its stories is `done` AND the epic
-          itself is not already in `completedEpics` (prefer `currentEpic` first if it qualifies, since
-          that's almost always the epic that was just finished).
+          on epic completion, not on what the user happened to name as the target. Determine this by
+          mechanical enumeration, not impression: for each epic number present, list every
+          `development_status` key matching `<epic>-<number>-*` (excluding the `epic-<epic>` and
+          `epic-<epic>-retrospective` keys themselves) and count how many are `done`. An epic only
+          qualifies when that count equals the TOTAL number of such story keys for that epic — not
+          merely the ones touched so far this run — AND the epic is not already in `completedEpics`
+          (prefer `currentEpic` first if it qualifies, since that's almost always the epic that was
+          just finished).
           - If such an epic is found: set `currentEpic` = that epic, `phase = "retro"`.
         - Else (no target story pending, and every fully-done epic already has a retrospective):
           - Set `status = "complete"`, `phase = "done"`.
@@ -557,12 +561,28 @@ nodes:
              commit just to persist this.
         Then advance:
         - Append `{currentStory}` to `completedStories`. Set `currentStory = null`, `reviewRetry = 0`.
-        - Re-read sprint-status: are ALL stories in `{currentEpic}` now `done`?
-            - Yes AND `{currentEpic}` not in `completedEpics` → set `phase = "retro"` (keep `currentEpic`).
-            - Otherwise → set `phase = "select"`.
+        - Determine epic completion by mechanical enumeration, not impression — this check has
+          previously been gotten wrong when phrased loosely, prematurely jumping to `retro` on an
+          epic that still has backlog stories: list EVERY `development_status` key matching
+          `{currentEpic}-<number>-*` (i.e. every story key for this epic, ignoring the
+          `epic-{currentEpic}`/`epic-{currentEpic}-retrospective` keys themselves), then count how
+          many of those keys have status `done`. Only if that count equals the total count of such
+          keys (every single story in the epic, not just the ones this run happened to touch) is the
+          epic actually done.
+            - Epic fully done AND `{currentEpic}` not in `completedEpics` → set `phase = "retro"`
+              (keep `currentEpic`).
+            - Otherwise (any story in the epic — including ones not yet reached this run — is still
+              not `done`) → set `phase = "select"`.
         Update `state.json`. End turn.
 
         ## phase = "retro"  → bmad-retrospective (per epic, NON-BLOCKING)
+        **Guard first**: before doing anything else, re-verify `{currentEpic}` is genuinely fully
+        done by the same mechanical enumeration as above (every `{currentEpic}-<number>-*` key in
+        `development_status` is `done` — not just the ones this run touched). This phase has
+        previously been entered by mistake on a partially-done epic; if that enumeration finds even
+        one non-`done` story, this was a wrong transition — do NOT run the retrospective. Instead
+        set `currentStory = null`, `phase = "select"`, update `state.json`, and end turn so `select`
+        can pick up the epic's next real backlog story.
         Use the **bmad-retrospective** skill for epic `{currentEpic}`, in #YOLO mode. Assume NO user
         input. For every prompt that expects input, decide autonomously from sprint-status, the
         story files and their dev notes, the previous retrospective (if any), and the architecture/PRD.
