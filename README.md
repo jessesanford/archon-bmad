@@ -53,7 +53,7 @@ archon workflow list | grep archon-bmad
 
 | Workflow                                                | Automates                                                                 |
 | ------------------------------------------------------- | ------------------------------------------------------------------------- |
-| [`archon-bmad-story-automator`](#archon-bmad-story-automator) | The BMAD implementation loop — create → dev → review → commit per story, with per-epic retrospectives and (in [stacked-branching](#stacked-branching--pr-automation) mode) a final cross-story [integration rebuild & antagonistic review](#post-fix-integration-rebuild--antagonistic-review). |
+| [`archon-bmad-story-automator`](#archon-bmad-story-automator) | The BMAD implementation loop — create → dev → review → commit per story, with per-epic retrospectives and (in [stacked-branching](#stacked-branching--pr-automation) mode) a repeatable, per-epic [integration rebuild, functional test & antagonistic review cycle](#per-epic-integration-rebuild-functional-test--antagonistic-review). |
 
 _More workflows will be added here over time._
 
@@ -80,10 +80,13 @@ For each selected story it plays one role per loop iteration, verifying against 
 | `review` | _inlined adversarial reviewer_  | Attack impl vs story claims + git reality; auto-fix; **gate = 0 CRITICAL & 0 HIGH**; loops ≤ 8 |
 | `commit` | —                               | `git commit` after review verifies; if stacked branching is on, also pushes and opens/updates this story's PR |
 | `retro`  | `bmad-retrospective`            | Fires per epic when every story in it is `done`; YOLO; non-blocking |
-| `integrate_review` | — | Runs **once**, after everything above — *only does real work in [stacked-branching](#stacked-branching--pr-automation) mode* — see [Post-fix integration rebuild & antagonistic review](#post-fix-integration-rebuild--antagonistic-review) |
+| `rebase_cascade` | — | *Stacked-branching mode only* — refreshes the whole stack against upstream before rebuilding/testing/reviewing it — see [below](#per-epic-integration-rebuild-functional-test--antagonistic-review) |
+| `integration_build` | — | *Stacked-branching mode only* — rebuilds a disposable cumulative integration branch from the freshly-rebased stack |
+| `functional_test` | — | *Stacked-branching mode only* — generates-if-missing and runs cumulative epic-level and project-level acceptance tests |
+| `integrate_review` | — | *Stacked-branching mode only* — antagonistic requirements-driven review of the disposable branch, corroborated by the passing functional tests — see [Per-epic integration rebuild, functional test & antagonistic review](#per-epic-integration-rebuild-functional-test--antagonistic-review) |
 
 When everything in your selection is `done`, each completed epic has had its retrospective, and the
-integration review (below) has run, the run finishes and emits a report.
+highest completed epic's validation cycle (above) has run, the run finishes and emits a report.
 
 #### Review gating & automatic fixes
 
@@ -255,54 +258,85 @@ adapts, with zero configuration:
 This requires no changes to the rule file's location or content beyond what your project already uses
 for [the convention itself](https://github.com/github/gh-stack) — the workflow only *reads* it.
 
-#### Post-fix integration rebuild & antagonistic review
+#### Per-epic integration rebuild, functional test & antagonistic review
 
 The per-story `review` phase is deliberately narrow — each pass only ever sees **one story's own
 diff**. That's the right scope for "did this story do what it claims," but it structurally cannot catch
-a gap that only exists at the **seam between stories**: e.g. an early story adds a processor module,
-and a later story that's supposed to wire it into the live pipeline never actually does, or a config
-flag one story introduces is set but nothing downstream ever reads it. Each story's review looks clean
-in isolation; the feature is still broken end-to-end. This is exactly the class of defect a real
-antagonistic pass over the *whole merged stack* — read against the PRD, epics, and architecture, not
-just each story's own acceptance criteria — is built to catch.
+a gap that only exists at the **seam between stories or epics**: e.g. an early story adds a processor
+module, and a later story that's supposed to wire it into the live pipeline never actually does, or a
+config flag one epic introduces is set but nothing in a later epic ever reads it. Each story's review
+looks clean in isolation; the feature is still broken end-to-end. This is exactly the class of defect a
+real antagonistic pass over the *whole merged stack* — corroborated by actually **running** cumulative
+acceptance tests, not just reading code — is built to catch.
 
-`integrate_review` is a final phase that runs this check automatically, **once per run**, after every
-targeted story is `done` and any newly-completed epic's retrospective has fired — the last gate before
-`status` is allowed to reach `complete`:
+Rather than a single check at the very end of a run, this is a **repeatable four-step cycle** that runs
+after **every epic** completes (and as a catch-all — see below — for runs where no epic's retrospective
+freshly fires), each time cumulatively covering everything from epic 1 through whichever epic just
+finished:
 
-1. **Rebuild the whole stack, fresh.** It doesn't limit itself to the stories this particular run
-   touched — it enumerates every `feat/*/story-*` branch that exists in the repo today (the full
-   feature as it currently stands, e.g. all 5 epics / 15 stories, even on a run that only fixed 7 of
-   them) and sequentially `git merge --no-ff`s them, in stack order, onto a **fresh, local-only,
-   never-pushed** `integration/review-<timestamp>` branch. Nothing is pushed anywhere and nothing is
-   deleted afterward — the branch is left in place for you to inspect or reuse.
-2. **One antagonistic review of the merged result.** Prefers a clean sub-agent/Task-tool context (falls
-   back to reviewing inline if unavailable) that reads the full PRD, epics/acceptance-criteria,
-   architecture doc, and spec, plus every story file in the stack — then inspects the *actual merged
-   code*, not story claims, checking criteria that only make sense when multiple stories compose
-   together. Findings are classified `CRITICAL`/`HIGH`/`MEDIUM`/`LOW` with file/line evidence, written
-   to `{planningArtifacts}/integration-review-<date>.md`.
-3. **Branches on the outcome, doesn't auto-fix:**
-   - **0 CRITICAL / 0 HIGH** → `integrationReviewDone = true`, the run proceeds to `status =
-     "complete"` as normal.
-   - **1+ CRITICAL or HIGH** → the run halts with `status = "needs-attention"` (distinct from `failed`
-     — every individual story genuinely passed its own review; the gap is cross-story) and the final
-     report points at the findings file and recommends running BMad's `bmad-correct-course` workflow,
-     since a cross-story integration gap is exactly the kind of "significant change" that process
-     exists to triage (it may need new fix-stories, not a blind patch).
-   - A **merge conflict** while rebuilding the stack halts the same way — that means the stack itself
-     is no longer cleanly stacked (e.g. a fix landed on one branch without rebasing the branches after
-     it), which needs a human decision, not an autonomous resolution.
+1. **`rebase_cascade`** — refresh the stack against `upstream`/`origin` first (fast-forward the default
+   branch, then cascade-rebase every `feat/*/story-*` branch onto it in stack order, filtered to epics
+   `<= currentValidationEpic`), so the next steps validate the *freshest* code, not a stale snapshot.
+   A conflict here halts with `status = "needs-attention"` — a stack that no longer rebases cleanly
+   needs a human decision, not an autonomous resolution.
+2. **`integration_build`** — merge that freshly-rebased, filtered stack, in order, onto a fresh,
+   local-only, never-pushed `integration/epic-{N}-validation-<suffix>` branch. Nothing is pushed
+   anywhere; the branch is disposable and rebuilt from scratch every cycle. A merge conflict here halts
+   the same way as above.
+3. **`functional_test`** — inventories existing functional/acceptance-level suites on that branch and
+   generates whichever are missing, in **two distinct categories**:
+   - **Epic-level tests**, one per epic in scope, proving that epic's own acceptance criteria hold
+     end-to-end (not just asserted per-story in isolation).
+   - **Project-level / cross-epic tests** — a smaller, standing suite derived from the PRD's overall
+     goals and any requirement or user journey that only makes sense once two or more epics compose
+     together (e.g. "a span created by an early epic's instrumentation is queryable through a later
+     epic's export path"). No amount of per-epic testing alone can catch this class of gap.
 
-**This is the mechanized version of a manual process**: rebuild a disposable local integration branch
-by replaying the stack in order, then point one adversarial reviewer at the *composed* result instead
-of any single story's diff.
+   Both categories follow the spirit of `bmad-qa-generate-e2e-tests` (existing framework/patterns,
+   happy path + explicit edge cases, no over-engineering) but skip that skill's "ask the user what to
+   test" step, deriving scope autonomously from the epics'/PRD's acceptance criteria instead — this
+   phase runs fully autonomously. Tests are committed only on the disposable integration branch, never
+   on any story branch. The full suite (existing + newly generated, both categories) is then run for
+   real. **Any failure, in either category**, is direct executable proof of a break and halts with
+   `status = "needs-attention"` — it is never treated as a soft signal or auto-fixed.
+4. **`integrate_review`** — only reached once every test above passes. One antagonistic review of the
+   merged branch, prefers a clean sub-agent/Task-tool context (falls back to reviewing inline if
+   unavailable), reading the full PRD, epics/acceptance-criteria, architecture doc, and spec, plus every
+   story file in scope — then inspecting the *actual merged code*, not story claims, using the passing
+   functional tests as corroborating (not exculpatory) evidence. Findings are classified
+   `CRITICAL`/`HIGH`/`MEDIUM`/`LOW` with file/line evidence, written to
+   `{planningArtifacts}/integration-review-epic-{N}-<date>.md`.
 
-**Single-branch (non-stacked) projects**: this phase is a deliberate no-op. Without the
+**Branches on the outcome, doesn't auto-fix:**
+- **0 CRITICAL / 0 HIGH** → every epic from the lowest not-yet-validated epic through the current one is
+  appended to `epicsValidated`, and the run resumes normal selection (next epic's stories, or `status =
+  "complete"` if nothing else is pending).
+- **1+ CRITICAL or HIGH finding, or any functional test failure** → the run halts with `status =
+  "needs-attention"` (distinct from `failed` — every individual story genuinely passed its own review;
+  the gap is cross-story/cross-epic) and the final report points at the findings file and recommends
+  running BMad's `bmad-correct-course` workflow, since this is exactly the kind of "significant change"
+  that process exists to triage (it may need new fix-stories, not a blind patch).
+
+**When this cycle triggers:**
+- **Eagerly**, right when an epic's own retrospective (`retro` phase) lands, covering that epic and
+  everything beneath it.
+- **As a catch-all**, from `select`'s end-of-run gate: if no pending story/retro work remains but the
+  highest fully-`done` epic in `sprint-status.yaml` is still absent from `epicsValidated` — e.g. a
+  defect-fix pass that re-touches stories across several already-completed epics never causes any of
+  their retrospectives to re-fire (retrospectives are guarded against re-running), so without this
+  catch-all the cycle would silently never run at all in that scenario.
+
+**This is the mechanized version of a manual process**: keep the stack fresh, rebuild a disposable local
+integration branch by replaying it in order, prove the cumulative acceptance criteria actually run, then
+point one adversarial reviewer at the composed result — repeated after every epic instead of deferred to
+the very end of a multi-epic run, so drift and cross-story/cross-epic gaps never have a chance to pile
+up unnoticed.
+
+**Single-branch (non-stacked) projects**: this cycle is a deliberate no-op. Without the
 [stacked-branching convention](#stacked-branching--pr-automation) every story already lands on the same
-one worktree branch, so there's no separate `feat/*/story-*` branches to rebuild or merge — the phase
-detects none exist, marks itself done immediately, and the run completes exactly as it always has. You
-only get real cross-story integration review by adopting stacked branching.
+one worktree branch, so there's no separate `feat/*/story-*` branches to rebuild or merge — `select`'s
+catch-all never fires, and the run completes exactly as it always has. You only get real cross-story
+integration validation by adopting stacked branching.
 
 #### Configuration knobs
 
