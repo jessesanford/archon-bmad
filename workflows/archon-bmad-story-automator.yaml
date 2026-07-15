@@ -187,6 +187,20 @@ nodes:
       DEFAULT_BRANCH="$(git -C "$ROOT" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')"
       [ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH="main"
 
+      # ─── Rebase remote (for the rebase_cascade phase) ────────────────────────────────
+      # Some repos are forks that push their work to "origin" but the real, canonical
+      # source of truth to periodically re-sync against is a separate "upstream" remote
+      # (the shared org repo). Prefer it when it exists; only fall back to "origin" (the
+      # same remote everything else in this workflow already pushes to) when it doesn't.
+      # Never push to upstream -- it is fetch-only, resolved here purely so rebase_cascade
+      # knows what to rebase the stack onto.
+      REBASE_REMOTE="origin"
+      UPSTREAM_AVAILABLE=false
+      if git -C "$ROOT" remote get-url upstream >/dev/null 2>&1; then
+        REBASE_REMOTE="upstream"
+        UPSTREAM_AVAILABLE=true
+      fi
+
       # gh / gh-stack availability -- best-effort PR automation only; never required.
       GH_AVAILABLE=false
       command -v gh >/dev/null 2>&1 && GH_AVAILABLE=true
@@ -234,6 +248,8 @@ nodes:
         "baseBranch": "$BASE_BRANCH",
         "stackedBranching": $STACKED_BRANCHING,
         "defaultBranch": "$DEFAULT_BRANCH",
+        "rebaseRemote": "$REBASE_REMOTE",
+        "upstreamAvailable": $UPSTREAM_AVAILABLE,
         "ghAvailable": $GH_AVAILABLE,
         "ghStackAvailable": $GH_STACK_AVAILABLE
       }
@@ -254,8 +270,10 @@ nodes:
         "skipAutomate": $SKIP_AUTOMATE,
         "completedStories": [],
         "completedEpics": [],
-        "integrationReviewDone": false,
-        "integrationReviewBranch": null,
+        "epicsValidated": [],
+        "currentValidationEpic": null,
+        "validationBranch": null,
+        "functionalTestSummary": null,
         "status": "running",
         "reason": ""
       }
@@ -267,6 +285,7 @@ nodes:
       echo "  skipAutomate:      $SKIP_AUTOMATE"
       echo "  stackedBranching:  $STACKED_BRANCHING (rule: ${RULE_FILE:-none found})"
       echo "  defaultBranch:     $DEFAULT_BRANCH"
+      echo "  rebaseRemote:      $REBASE_REMOTE (upstreamAvailable=$UPSTREAM_AVAILABLE)"
       echo "  gh/gh-stack:       gh=$GH_AVAILABLE gh-stack=$GH_STACK_AVAILABLE"
     timeout: 30000
 
@@ -302,8 +321,8 @@ nodes:
         not yet `done`.)
 
         ## FIRST — load your state (every iteration)
-        1. Read `$ARTIFACTS_DIR/bmad-env.json` → `{ root, outputFolder, implementationArtifacts, planningArtifacts, sprintStatus, skipAutomate, stackedBranching, defaultBranch, ghAvailable, ghStackAvailable }`.
-        2. Read `$ARTIFACTS_DIR/state.json` → `{ phase, currentStory, currentEpic, epicSlug, currentStoryBranch, parentStoryBranch, reviewRetry, maxReviewRetries, createRetry, maxCreateRetries, integrationReviewDone, integrationReviewBranch, status, ... }`.
+        1. Read `$ARTIFACTS_DIR/bmad-env.json` → `{ root, outputFolder, implementationArtifacts, planningArtifacts, sprintStatus, skipAutomate, stackedBranching, defaultBranch, rebaseRemote, upstreamAvailable, ghAvailable, ghStackAvailable }`.
+        2. Read `$ARTIFACTS_DIR/state.json` → `{ phase, currentStory, currentEpic, epicSlug, currentStoryBranch, parentStoryBranch, reviewRetry, maxReviewRetries, createRetry, maxCreateRetries, epicsValidated, currentValidationEpic, validationBranch, functionalTestSummary, status, ... }`.
         3. Read the sprint-status file at `sprintStatus`. Its `development_status` map is the
            SOURCE OF TRUTH for which stories are `done` / `in-progress` / `backlog`.
 
@@ -411,13 +430,23 @@ nodes:
           qualifies here) (prefer `currentEpic` first if it qualifies, since that's almost always the
           epic that was just finished).
           - If such an epic is found: set `currentEpic` = that epic, `phase = "retro"`.
-        - Else if `integrationReviewDone` is not yet `true` in `state.json`: set
-          `phase = "integrate_review"` (see that phase below). This runs exactly ONCE per run, after
-          every targeted story is `done` and every newly-completed epic's retrospective (if any) has
-          fired — a final cross-story audit that a clean per-story review cannot catch, since each
-          story's own review only ever sees that story's own diff.
-        - Else (no target story pending, every fully-done epic already has a retrospective, and the
-          integration review has already run this run):
+        - Else if `stackedBranching` is `true` **and** the HIGHEST epic number with a fully-done
+          `epic-{N}` in sprint-status (every `{N}-<number>-*` key `done`, by the same mechanical
+          enumeration as the retro check above — across ALL epics in sprint-status, not just the
+          ones this run's own selection targeted) is not yet present in `epicsValidated`: this is
+          `select`'s catch-all safety net for the per-epic validation cycle. Normally that cycle is
+          triggered eagerly, right when each epic's own retrospective lands (see the `retro` phase's
+          ending) — but a run where every epic's retrospective ALREADY existed before this run
+          started (e.g. a defect-fix pass re-touching already-`done` epics) never fires that eager
+          trigger, so nothing yet guarantees the stack has been rebuilt/tested/reviewed since the
+          fixes landed. Set `currentValidationEpic` = that highest fully-done epic number, `phase =
+          "rebase_cascade"` (see that phase and the ones after it below) — cumulative validation at
+          the highest epic covers everything beneath it too, so there's no need to iterate epic by
+          epic here.
+        - Else (no target story pending, every fully-done epic already has a retrospective, and
+          — in stacked-branching mode — the highest fully-done epic has already completed its
+          validation cycle; single-branch mode has no stack to cascade/rebuild/test in the first
+          place):
           - Set `status = "complete"`, `phase = "done"`.
         Update `state.json`. End turn.
 
@@ -673,40 +702,111 @@ nodes:
           the local worktree — this is no longer best-effort/silently-ignorable: if the push fails,
           log the exact error in `state.json`'s `reason` so a human can see the retro commit exists
           locally but didn't reach `origin`.
-        - Append `{currentEpic}` to `completedEpics`. Set `currentEpic = null`, `phase = "select"`.
+        - Append `{currentEpic}` to `completedEpics`. Set `currentEpic = null`.
+        - If `stackedBranching` is `true` **and** `{currentEpic}` is not already present in
+          `epicsValidated`: set `currentValidationEpic = {currentEpic}`, `phase = "rebase_cascade"`
+          (see that phase and the ones after it below) — run the full rebase-freshen →
+          integration-rebuild → functional-test → antagonistic-review cycle right after every epic
+          lands, cumulatively covering everything up through this epic, rather than letting drift
+          and unverified cross-story gaps accumulate across an entire multi-epic run. Otherwise
+          (single-branch mode, or this epic was already validated by an earlier cycle this run) set
+          `phase = "select"` directly.
         Update `state.json`. End turn.
 
-        ## phase = "integrate_review"  → cross-story integration rebuild + antagonistic review (NON-BLOCKING, runs ONCE)
-        Only reached when `stackedBranching` is `true` and every targeted story is `done` and any
-        newly-completed epic's retrospective has already fired. A per-story review only ever sees
-        that one story's own diff — it cannot catch a gap that only exists at the seam BETWEEN
-        stories (e.g. story A adds a processor module but the story that's supposed to wire it into
-        the live pipeline never actually does so). This phase closes that gap: it rebuilds the whole
-        current story stack on a disposable branch and runs one antagonistic, requirements-driven
-        review across the merged result before the run is allowed to reach `status = "complete"`.
+        ## phase = "rebase_cascade"  → step 1/4 of per-epic validation: refresh the stack against upstream
+        Entered whenever `currentValidationEpic` is set — either right after that epic's
+        retrospective lands (see the `retro` phase's ending) or as `select`'s catch-all safety net
+        for a run where no NEW retrospective fired this run (a defect-fix pass, for example) but the
+        highest fully-done epic still isn't in `epicsValidated`. This is step 1 of the four-step
+        per-epic validation cycle — `rebase_cascade` → `integration_build` → `functional_test` →
+        `integrate_review` — that runs cumulatively through `{currentValidationEpic}` every time an
+        epic completes (see [Post-fix / post-epic integration validation] in the project README for
+        the full rationale). The goal of this step specifically: make sure every `feat/*/story-*`
+        branch up to and including `{currentValidationEpic}` is rebased fresh onto the real upstream
+        tip, cascading each branch onto the *newly rebased* version of the branch before it, in stack
+        order — exactly the manual cascade-rebase procedure this project used once by hand, now
+        automated so the stack never drifts stale across a long multi-epic run.
 
-        1. **Determine the full current stack**, not just the stories this run touched: `git -C
-           {root} branch -a --list 'feat/*/story-*'`, sorted by epic number then story number. This
-           is every rung of the stack that exists in the repo today, whether or not this particular
-           run modified it — the review must audit the whole feature as it stands now, since a fix
-           to an early story can only be validated by seeing how it composes with everything after it.
-        2. **Resolve the stack's true base** the same way `select` step 0 resolves it: if any
-           `feat/*/story-*` branches exist, their collective ancestor is whichever commit `git -C
-           {root} merge-base` reports for the FIRST (lowest epic.story) branch against
-           `{defaultBranch}`. If none exist, skip this whole phase (nothing to integrate), set
-           `integrationReviewDone = true`, `phase = "select"`, and end turn.
-        3. **Create a fresh, local-only integration branch** — never reuse a name from a previous
-           run, and never push this branch anywhere. Compute `{runTimestamp}` yourself right now
-           (`date +%Y%m%d-%H%M%S`, or reuse one already recorded in `state.json` from a prior
-           iteration of THIS phase — e.g. if a merge conflict or review had to be re-attempted, keep
-           the same branch name rather than creating a new one each retry) so concurrent/repeated
-           runs never collide:
-           `git -C {root} checkout -b integration/review-{runTimestamp} <that base commit>`
-           and record `integrationReviewBranch = "integration/review-{runTimestamp}"` in
-           `state.json` immediately, before doing anything else in this phase.
-        4. **Merge every stack branch into it, in sprint order** (lowest epic.story first):
-           `git -C {root} merge --no-ff <branch> -m "merge: <branch> into integration/review-{runTimestamp} (post-fix verification)"`
-           for each branch in turn.
+        1. **Resolve the upstream-of-record.** Use `{rebaseRemote}` from `bmad-env.json` (`upstream`
+           if that remote exists in this repo, else `origin` — resolved once in `init`, see
+           [Requirements]) and `{defaultBranch}`. Fetch it fresh: `git -C {root} fetch {rebaseRemote}
+           {defaultBranch}`. The new base tip is `git -C {root} rev-parse
+           {rebaseRemote}/{defaultBranch}`.
+        2. **Fast-forward the local `{defaultBranch}` itself — never rebase or rewrite it.**
+           `git -C {root} checkout {defaultBranch} && git -C {root} merge --ff-only
+           {rebaseRemote}/{defaultBranch}`. Record its pre-merge tip as `old_base` and its new tip
+           (after the ff-only merge) as `new_base`.
+           - **If the fast-forward fails** (local `{defaultBranch}` has diverged — e.g. commits exist
+             on it that aren't in `{rebaseRemote}/{defaultBranch}`), STOP. Do not force, rebase, or
+             merge `{defaultBranch}` any other way. A diverged default branch is exactly the class of
+             mistake this project hit once before (a manual test-merge landed directly on `main`
+             instead of a disposable branch) — it needs a human decision, not an autonomous rewrite
+             of the branch everything else stacks on. Set `status = "needs-attention"`, record the
+             divergent commits in `state.json`'s `reason`, `phase = "done"`. Update `state.json`. End
+             turn.
+        3. **Enumerate the stack up to `{currentValidationEpic}`**: `git -C {root} branch -a --list
+           'feat/*/story-*'`, sorted by epic number then story number, FILTERED to epic number <=
+           `{currentValidationEpic}` — a defect-fix or out-of-order run may already have later
+           epics' branches sitting in the repo, but this cycle validates cumulative functionality
+           only "up to this point," so branches from a later epic must be excluded here even if they
+           exist. If the filtered list is empty, there's nothing to cascade — skip to step 5 with no
+           branches processed.
+        4. **Cascade-rebase every filtered branch in stack order**, threading each branch's own
+           old/new tip into the next:
+           - Start with `prev_old = old_base`, `prev_new = new_base` (from step 2).
+           - For each branch, in order:
+             - Record its current tip: `branch_old = git -C {root} rev-parse <branch>`.
+             - `git -C {root} rebase --onto {prev_new} {prev_old} <branch>` — this replays only the
+               commits unique to `<branch>` (relative to its own previous parent state, `prev_old`)
+               onto the freshly-rebased `prev_new`, exactly like the manual procedure.
+             - **If this rebase conflicts**: `git -C {root} rebase --abort`. Do NOT attempt to
+               resolve it yourself — per this workflow's established philosophy (see
+               `integration_build` below), a rebase conflict here means the stack itself needs a
+               human look, not an autonomous resolution. Record the branch and the conflicting file
+               list (`git -C {root} diff --name-only --diff-filter=U` before aborting) in
+               `state.json`'s `reason`, set `status = "needs-attention"`, `phase = "done"`. Update
+               `state.json`. End turn.
+             - On success, record its new tip: `branch_new = git -C {root} rev-parse <branch>`. This
+               becomes `prev_old = branch_old`, `prev_new = branch_new` for the NEXT branch in the
+               stack.
+             - Best-effort push the freshly-rebased branch back to `origin` (never to `upstream`):
+               `git -C {root} push --force-with-lease origin <branch>`. A push failure here is
+               logged in your turn's summary but must NOT fail the run — the rebase itself already
+               succeeded locally and every later branch in the cascade still needs processing; a
+               human can push it later.
+        5. **Record the outcome.** Append a short table (branch, old SHA, new SHA, status) to your
+           turn's summary so the final `report` node can surface it. This workflow does not require
+           a separate on-disk report for this step (unlike `integrate_review`'s findings doc) since
+           there is nothing here for a human to triage when it succeeds — the whole point is that
+           it's routine, low-drama maintenance.
+        6. Set `phase = "integration_build"`. Update `state.json`. End turn.
+
+        ## phase = "integration_build"  → step 2/4: rebuild the disposable cumulative integration branch
+        Rebuilds a fresh, local-only branch containing every story up to and including
+        `{currentValidationEpic}` — freshly rebased by the previous `rebase_cascade` step — so the
+        next two steps (`functional_test`, `integrate_review`) have one concrete, disposable artifact
+        to test and review against.
+
+        1. **Enumerate the stack up to `{currentValidationEpic}`**, same filter as `rebase_cascade`
+           step 3: `git -C {root} branch -a --list 'feat/*/story-*'`, sorted by epic number then
+           story number, epic number <= `{currentValidationEpic}` only.
+           - If empty (shouldn't normally happen since `epicsValidated` guards re-entry, but treat it
+             as a harmless no-op rather than erroring): append `{currentValidationEpic}` to
+             `epicsValidated`, clear `currentValidationEpic` (`null`), `phase = "select"`. Update
+             `state.json`. End turn.
+        2. **Resolve the stack's true base**: whichever commit `git -C {root} merge-base` reports
+           for the FIRST (lowest epic.story) filtered branch against `{defaultBranch}`.
+        3. **Create the branch** — never reuse a name from a previous cycle, and never push it
+           anywhere. Compute a fresh suffix now (`date +%Y%m%d-%H%M%S`, or reuse one already
+           recorded in `state.json` if this is a RETRY of THIS SAME cycle after a conflict, rather
+           than creating a new disposable branch on every retry):
+           `git -C {root} checkout -b integration/epic-{currentValidationEpic}-validation-<suffix>
+           <that base commit>` — and record `validationBranch =
+           "integration/epic-{currentValidationEpic}-validation-<suffix>"` in `state.json`
+           immediately, before doing anything else in this phase.
+        4. **Merge every filtered branch into it, in sprint order** (lowest epic.story first):
+           `git -C {root} merge --no-ff <branch> -m "merge: <branch> into {validationBranch} (epic
+           {currentValidationEpic} cumulative validation)"` for each branch in turn.
            - **If any merge conflicts**: `git -C {root} merge --abort`, record the branch and the
              conflicting file list in `state.json`'s `reason`, set `status = "needs-attention"`,
              `phase = "done"`. Do NOT attempt to resolve the conflict yourself — a conflict here means
@@ -714,42 +814,138 @@ nodes:
              follow-up rebase of dependent branches), which needs a human decision, not an
              autonomous merge resolution. Update `state.json`. End turn.
            - If every merge is clean (the expected outcome for a properly stacked/rebased set of
-             branches), continue.
-        5. **Run one antagonistic, requirements-driven review** of the fully-merged integration
-           branch. Prefer spawning this as a separate subagent/task (if your runtime exposes a
-           Task-style tool, use it) so the review has a clean, unbiased context rather than reusing
-           this phase's own conversation; if no such tool is available, perform the review yourself
-           in this same turn instead of skipping it. Either way, the review must:
+             branches, since `rebase_cascade` just ran), continue.
+        5. Set `phase = "functional_test"`. Update `state.json`. End turn.
+
+        ## phase = "functional_test"  → step 3/4: generate-if-missing + run cumulative acceptance tests
+        A clean antagonistic *read* of the code (the next and final step) is necessary but not
+        sufficient — it can still miss a genuine runtime break that only shows up when the code
+        actually executes. This phase makes sure every epic's acceptance criteria, from epic 1
+        through `{currentValidationEpic}`, has a real, currently-passing, executable
+        functional/acceptance test on `{validationBranch}` — not just unit tests written
+        story-by-story in isolation, which can each pass individually while the seam between them is
+        still broken.
+
+        This phase generates and runs TWO distinct categories of tests, both disposable and living
+        only on `{validationBranch}` — never on story branches:
+        - **Epic-level acceptance tests**: one per epic in scope, proving that epic's own acceptance
+          criteria hold end-to-end.
+        - **Project-level acceptance tests**: a smaller, standing suite proving the PRD's overall
+          goals/success criteria and any *cross-epic* behavior — i.e. requirements that only make
+          sense once two or more epics compose together (e.g. "a span created by the epic 2
+          instrumentation is queryable through the epic 4 export path") — which no single epic's own
+          acceptance-criteria list would ever call out, and which per-epic tests alone can never
+          catch no matter how many epics they individually cover.
+
+        1. **Gather the cumulative acceptance-criteria scope.** Read the epics/acceptance-criteria
+           file (resolve its path via `{planningArtifacts}` in `bmad-env.json`) for every epic
+           numbered 1 through `{currentValidationEpic}`, and every story file under those epics in
+           `{implementationArtifacts}`. ALSO read the full PRD (same `{planningArtifacts}`) for its
+           overall goals, success metrics, and any requirement or user journey whose wording spans
+           more than one epic — this is the project-level scope, independent of `{currentValidationEpic}`
+           only in that it can't be evaluated until at least two epics exist, but otherwise always
+           re-derived fresh each cycle from the PRD, not carried forward.
+        2. **Inventory existing functional/acceptance-level tests already on `{validationBranch}`** —
+           distinct from per-story unit tests: look for integration/e2e-style suites (existing
+           `tests/integration/`, `tests/e2e/`, or equivalently-named directories per this project's
+           actual conventions; check each story's own File List / dev notes for what test types it
+           already added). Separately, look for a project-level/cross-epic suite (e.g.
+           `tests/acceptance/`, `tests/project/`, or equivalently-named per this project's actual
+           conventions — do not invent a new convention if one already exists). For each epic in
+           scope, determine whether its acceptance criteria are actually exercised end-to-end by
+           something that runs real code paths together (not mocked away at the seam), not just
+           asserted individually per story. Separately, determine whether the PRD's cross-epic
+           requirements/user journeys identified in step 1 are covered by an existing project-level
+           test.
+        3. **For every epic in scope whose acceptance criteria have no such cumulative test**,
+           generate one now, directly on `{validationBranch}` (never on any story branch — this is a
+           verification artifact of the disposable integration branch, not attributable to one
+           story). **Separately, for every PRD-level cross-epic requirement/user journey identified
+           in step 1 that has no existing project-level test**, generate one in the project-level
+           suite, exercising the real code paths across the epics it spans (not mocked at the seam).
+           Both categories follow the same spirit as the `bmad-qa-generate-e2e-tests` skill (use the
+           project's existing test framework and patterns; happy path + the acceptance criteria's own
+           explicit failure/edge cases; readable, minimal, no over-engineered fixtures) but drive
+           scope from the epic's/PRD's actual text, not a free-form feature name — and skip that
+           skill's own Step 1 (asking the user what to test) entirely, since this phase runs
+           autonomously; decide the scope yourself from the acceptance criteria and PRD.
+        4. **Commit the generated tests** on `{validationBranch}` — one commit for epic-level tests
+           (subject like `test(epic-{currentValidationEpic}): add cumulative acceptance tests`) and,
+           if any were generated, a separate commit for project-level tests (subject like `test:
+           add project-level cross-epic acceptance tests`) — this branch is local-only and
+           disposable, so these commits never need pushing.
+        5. **Run the full functional/acceptance test suite** (existing + newly generated, BOTH
+           epic-level and project-level) against `{validationBranch}`, using this project's real
+           test command(s) — reuse the same multi-ecosystem discovery the `dev` phase already does
+           (JS via `bun`/`npm`/`yarn`/`pnpm`, plus `pip`/`poetry`, `cargo`, `go test`, whichever
+           applies) rather than guessing a single command.
+        6. **Branch on the result:**
+           - **All tests pass**: record a short summary (`functionalTestSummary` — suite(s) run
+             (epic-level and project-level called out separately), pass count, any tests newly
+             generated this cycle in either category) in `state.json`, `phase = "integrate_review"`
+             (the next phase uses this summary as corroborating evidence).
+           - **Any test fails (epic-level OR project-level)**: this is direct, executable proof of a
+             cross-story or cross-epic break — do NOT treat it as a soft signal or let it pass
+             through to the review phase silently, and do NOT attempt to fix it yourself in this
+             phase. A functional break is exactly the kind of "significant change"
+             `bmad-correct-course` exists to triage, same as an antagonistic-review finding. Set
+             `status = "needs-attention"`, record which test(s) failed (and whether epic-level or
+             project-level) and their output in `state.json`'s `reason`, `phase = "done"`.
+           Update `state.json`. End turn.
+
+        ## phase = "integrate_review"  → step 4/4: antagonistic requirements-driven review
+        Reached only after `functional_test` has confirmed every test on `{validationBranch}`
+        passes. A per-story review only ever sees that one story's own diff — it cannot catch a gap
+        that only exists at the seam BETWEEN stories (e.g. story A adds a processor module but the
+        story that's supposed to wire it into the live pipeline never actually does so). Passing
+        functional tests prove the happy paths those tests cover actually work; this phase catches
+        everything else — acceptance criteria the tests don't happen to exercise, requirements
+        documented but not implemented, and code-quality-level cross-story issues — before the run is
+        allowed to consider this epic (and everything beneath it) genuinely validated.
+
+        1. **Run one antagonistic, requirements-driven review** of `{validationBranch}`. Prefer
+           spawning this as a separate subagent/task (if your runtime exposes a Task-style tool, use
+           it) so the review has a clean, unbiased context rather than reusing this cycle's own
+           conversation; if no such tool is available, perform the review yourself in this same turn
+           instead of skipping it. Either way, the review must:
            - Read the FULL PRD, epics/acceptance-criteria file, architecture document, and feature
-             spec (whatever this project's `bmad-prd`/`bmad-create-epics-and-stories`/
-             `bmad-architecture`/`bmad-spec` skills produced — resolve their paths via
-             `{planningArtifacts}`/`{implementationArtifacts}` in `bmad-env.json`, not guessed paths).
-           - Read every story file in `{implementationArtifacts}` for stories in this stack.
-           - Inspect the ACTUAL merged code on `integration/review-{runTimestamp}` — not just story
-             files' claims — to verify each acceptance criterion is genuinely satisfied, including
-             criteria that only make sense when multiple stories/epics compose together.
+             spec (resolve their paths via `{planningArtifacts}`/`{implementationArtifacts}` in
+             `bmad-env.json`, not guessed paths) — scoped to epics 1 through
+             `{currentValidationEpic}`.
+           - Read every story file in `{implementationArtifacts}` for stories in that scope.
+           - Take `{functionalTestSummary}` from `state.json` as corroborating evidence (tests
+             passing narrows what's already proven; it does NOT excuse skipping the read-level
+             review of everything the tests don't cover).
+           - Inspect the ACTUAL merged code on `{validationBranch}` — not just story files' claims —
+             to verify each acceptance criterion is genuinely satisfied, including criteria that only
+             make sense when multiple stories/epics compose together.
            - Be adversarial: assume guilty until proven innocent by the code; do not pad the report
              with trivia.
            - Classify every finding as CRITICAL / HIGH / MEDIUM / LOW with file/line evidence and a
              quote proving the gap, exactly as a `bmad-code-review`-style adversarial pass would, but
-             scoped to the WHOLE merged stack rather than one story's diff.
-           - Write the findings to `{planningArtifacts}/integration-review-{date}.md` (or
-             `{implementationArtifacts}/` if `planningArtifacts` is unavailable) with a summary table
-             of finding counts by severity.
-        6. **Branch on the outcome:**
-           - **0 CRITICAL and 0 HIGH findings**: set `integrationReviewDone = true`, note the clean
-             report's path in `state.json`, `phase = "select"` (which will now fall through to
-             `status = "complete"`). Update `state.json`. End turn.
+             scoped to the WHOLE merged stack (epics 1–`{currentValidationEpic}`) rather than one
+             story's diff.
+           - Write the findings to `{planningArtifacts}/integration-review-epic-
+             {currentValidationEpic}-{date}.md` (or `{implementationArtifacts}/` if
+             `planningArtifacts` is unavailable) with a summary table of finding counts by severity.
+        2. **Branch on the outcome:**
+           - **0 CRITICAL and 0 HIGH findings**: append every epic number from the lowest
+             not-yet-validated epic through `{currentValidationEpic}` to `epicsValidated`
+             (cumulative validation at epic N inherently covers everything through N, even epics
+             that never got their own individual cycle — e.g. a defect-fix run that jumps straight
+             to validating the highest epic), clear `currentValidationEpic` / `validationBranch` /
+             `functionalTestSummary` (all `null`), `phase = "select"` (resume normal selection —
+             which will now either move on to the next epic's own story work, or fall through to
+             `status = "complete"` if nothing else is pending).
            - **1+ CRITICAL or 1+ HIGH findings**: do NOT attempt to auto-fix — a cross-story
              integration gap is exactly the kind of "significant change" `bmad-correct-course` exists
-             to triage (it may need new fix-stories, not a blind patch). Set `integrationReviewDone =
-             true` (the review itself is done; only the fix-decision is pending), set `status =
-             "needs-attention"`, `phase = "done"`, and record the findings-report path plus a one-line
-             summary of the CRITICAL/HIGH counts in `state.json`'s `reason`. Update `state.json`. End
-             turn.
-        7. Leave the `integration/review-{runTimestamp}` branch in place either way (local-only,
-           never pushed) — it is the exact artifact the findings report was reviewed against, so a
-           human (or a follow-up `bmad-correct-course` cycle) can inspect it directly.
+             to triage (it may need new fix-stories, not a blind patch). Set `status =
+             "needs-attention"`, `phase = "done"`, and record the findings-report path plus a
+             one-line summary of the CRITICAL/HIGH counts in `state.json`'s `reason`.
+           Update `state.json`. End turn.
+        3. Leave `{validationBranch}` in place either way (local-only, never pushed) — it is the
+           exact artifact the findings report and functional tests were run against, so a human (or
+           a follow-up `bmad-correct-course` cycle) can inspect it directly.
 
         ---
 
