@@ -53,7 +53,7 @@ archon workflow list | grep archon-bmad
 
 | Workflow                                                | Automates                                                                 |
 | ------------------------------------------------------- | ------------------------------------------------------------------------- |
-| [`archon-bmad-story-automator`](#archon-bmad-story-automator) | The BMAD implementation loop — create → dev → review → commit per story, with per-epic retrospectives. |
+| [`archon-bmad-story-automator`](#archon-bmad-story-automator) | The BMAD implementation loop — create → dev → review → commit per story, with per-epic retrospectives and (in [stacked-branching](#stacked-branching--pr-automation) mode) a final cross-story [integration rebuild & antagonistic review](#post-fix-integration-rebuild--antagonistic-review). |
 
 _More workflows will be added here over time._
 
@@ -80,9 +80,10 @@ For each selected story it plays one role per loop iteration, verifying against 
 | `review` | _inlined adversarial reviewer_  | Attack impl vs story claims + git reality; auto-fix; **gate = 0 CRITICAL & 0 HIGH**; loops ≤ 8 |
 | `commit` | —                               | `git commit` after review verifies; if stacked branching is on, also pushes and opens/updates this story's PR |
 | `retro`  | `bmad-retrospective`            | Fires per epic when every story in it is `done`; YOLO; non-blocking |
+| `integrate_review` | — | Runs **once**, after everything above — *only does real work in [stacked-branching](#stacked-branching--pr-automation) mode* — see [Post-fix integration rebuild & antagonistic review](#post-fix-integration-rebuild--antagonistic-review) |
 
-When everything in your selection is `done` and each completed epic has had its retrospective, the
-run finishes and emits a report.
+When everything in your selection is `done`, each completed epic has had its retrospective, and the
+integration review (below) has run, the run finishes and emits a report.
 
 #### Review gating & automatic fixes
 
@@ -253,6 +254,55 @@ adapts, with zero configuration:
 
 This requires no changes to the rule file's location or content beyond what your project already uses
 for [the convention itself](https://github.com/github/gh-stack) — the workflow only *reads* it.
+
+#### Post-fix integration rebuild & antagonistic review
+
+The per-story `review` phase is deliberately narrow — each pass only ever sees **one story's own
+diff**. That's the right scope for "did this story do what it claims," but it structurally cannot catch
+a gap that only exists at the **seam between stories**: e.g. an early story adds a processor module,
+and a later story that's supposed to wire it into the live pipeline never actually does, or a config
+flag one story introduces is set but nothing downstream ever reads it. Each story's review looks clean
+in isolation; the feature is still broken end-to-end. This is exactly the class of defect a real
+antagonistic pass over the *whole merged stack* — read against the PRD, epics, and architecture, not
+just each story's own acceptance criteria — is built to catch.
+
+`integrate_review` is a final phase that runs this check automatically, **once per run**, after every
+targeted story is `done` and any newly-completed epic's retrospective has fired — the last gate before
+`status` is allowed to reach `complete`:
+
+1. **Rebuild the whole stack, fresh.** It doesn't limit itself to the stories this particular run
+   touched — it enumerates every `feat/*/story-*` branch that exists in the repo today (the full
+   feature as it currently stands, e.g. all 5 epics / 15 stories, even on a run that only fixed 7 of
+   them) and sequentially `git merge --no-ff`s them, in stack order, onto a **fresh, local-only,
+   never-pushed** `integration/review-<timestamp>` branch. Nothing is pushed anywhere and nothing is
+   deleted afterward — the branch is left in place for you to inspect or reuse.
+2. **One antagonistic review of the merged result.** Prefers a clean sub-agent/Task-tool context (falls
+   back to reviewing inline if unavailable) that reads the full PRD, epics/acceptance-criteria,
+   architecture doc, and spec, plus every story file in the stack — then inspects the *actual merged
+   code*, not story claims, checking criteria that only make sense when multiple stories compose
+   together. Findings are classified `CRITICAL`/`HIGH`/`MEDIUM`/`LOW` with file/line evidence, written
+   to `{planningArtifacts}/integration-review-<date>.md`.
+3. **Branches on the outcome, doesn't auto-fix:**
+   - **0 CRITICAL / 0 HIGH** → `integrationReviewDone = true`, the run proceeds to `status =
+     "complete"` as normal.
+   - **1+ CRITICAL or HIGH** → the run halts with `status = "needs-attention"` (distinct from `failed`
+     — every individual story genuinely passed its own review; the gap is cross-story) and the final
+     report points at the findings file and recommends running BMad's `bmad-correct-course` workflow,
+     since a cross-story integration gap is exactly the kind of "significant change" that process
+     exists to triage (it may need new fix-stories, not a blind patch).
+   - A **merge conflict** while rebuilding the stack halts the same way — that means the stack itself
+     is no longer cleanly stacked (e.g. a fix landed on one branch without rebasing the branches after
+     it), which needs a human decision, not an autonomous resolution.
+
+**This is the mechanized version of a manual process**: rebuild a disposable local integration branch
+by replaying the stack in order, then point one adversarial reviewer at the *composed* result instead
+of any single story's diff.
+
+**Single-branch (non-stacked) projects**: this phase is a deliberate no-op. Without the
+[stacked-branching convention](#stacked-branching--pr-automation) every story already lands on the same
+one worktree branch, so there's no separate `feat/*/story-*` branches to rebuild or merge — the phase
+detects none exist, marks itself done immediately, and the run completes exactly as it always has. You
+only get real cross-story integration review by adopting stacked branching.
 
 #### Configuration knobs
 
