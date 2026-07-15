@@ -129,16 +129,20 @@ nodes:
       # key; fall back to output_folder + /implementation-artifacts; then the default.
       OUTPUT_RAW="$(grep -E '^[[:space:]]*output_folder:' "$CONFIG" | head -1 | sed -E 's/^[[:space:]]*output_folder:[[:space:]]*//; s/["'"'"']//g; s/[[:space:]]*$//')"
       IMPL_RAW="$(grep -E '^[[:space:]]*implementation_artifacts:' "$CONFIG" | head -1 | sed -E 's/^[[:space:]]*implementation_artifacts:[[:space:]]*//; s/["'"'"']//g; s/[[:space:]]*$//')"
+      PLANNING_RAW="$(grep -E '^[[:space:]]*planning_artifacts:' "$CONFIG" | head -1 | sed -E 's/^[[:space:]]*planning_artifacts:[[:space:]]*//; s/["'"'"']//g; s/[[:space:]]*$//')"
       [ -z "$OUTPUT_RAW" ] && OUTPUT_RAW="_bmad-output"
       [ -z "$IMPL_RAW" ] && IMPL_RAW="$OUTPUT_RAW/implementation-artifacts"
+      [ -z "$PLANNING_RAW" ] && PLANNING_RAW="$OUTPUT_RAW/planning-artifacts"
 
       # Expand BMAD's {project-root} placeholder to the real repo root.
       OUTPUT_FOLDER="${OUTPUT_RAW//\{project-root\}/$ROOT}"
       IMPL="${IMPL_RAW//\{project-root\}/$ROOT}"
+      PLANNING="${PLANNING_RAW//\{project-root\}/$ROOT}"
 
       # Make any still-relative paths absolute against ROOT.
       case "$OUTPUT_FOLDER" in /*) : ;; *) OUTPUT_FOLDER="$ROOT/$OUTPUT_FOLDER" ;; esac
       case "$IMPL" in /*) : ;; *) IMPL="$ROOT/$IMPL" ;; esac
+      case "$PLANNING" in /*) : ;; *) PLANNING="$ROOT/$PLANNING" ;; esac
 
       SPRINT="$IMPL/sprint-status.yaml"
       if [ ! -f "$SPRINT" ]; then
@@ -221,6 +225,7 @@ nodes:
         "root": "$ROOT",
         "outputFolder": "$OUTPUT_FOLDER",
         "implementationArtifacts": "$IMPL",
+        "planningArtifacts": "$PLANNING",
         "sprintStatus": "$SPRINT",
         "skipAutomate": $SKIP_AUTOMATE,
         "mainRoot": "$MAIN_ROOT",
@@ -249,6 +254,8 @@ nodes:
         "skipAutomate": $SKIP_AUTOMATE,
         "completedStories": [],
         "completedEpics": [],
+        "integrationReviewDone": false,
+        "integrationReviewBranch": null,
         "status": "running",
         "reason": ""
       }
@@ -279,7 +286,7 @@ nodes:
       max_iterations: 150
       fresh_context: true
       until_bash: |
-        grep -qE '"status"[[:space:]]*:[[:space:]]*"(complete|failed)"' "$ARTIFACTS_DIR/state.json"
+        grep -qE '"status"[[:space:]]*:[[:space:]]*"(complete|failed|needs-attention)"' "$ARTIFACTS_DIR/state.json"
       prompt: |
         # BMAD Implementation Orchestrator — Build Loop
 
@@ -295,8 +302,8 @@ nodes:
         not yet `done`.)
 
         ## FIRST — load your state (every iteration)
-        1. Read `$ARTIFACTS_DIR/bmad-env.json` → `{ root, outputFolder, implementationArtifacts, sprintStatus, skipAutomate, stackedBranching, defaultBranch, ghAvailable, ghStackAvailable }`.
-        2. Read `$ARTIFACTS_DIR/state.json` → `{ phase, currentStory, currentEpic, epicSlug, currentStoryBranch, parentStoryBranch, reviewRetry, maxReviewRetries, createRetry, maxCreateRetries, status, ... }`.
+        1. Read `$ARTIFACTS_DIR/bmad-env.json` → `{ root, outputFolder, implementationArtifacts, planningArtifacts, sprintStatus, skipAutomate, stackedBranching, defaultBranch, ghAvailable, ghStackAvailable }`.
+        2. Read `$ARTIFACTS_DIR/state.json` → `{ phase, currentStory, currentEpic, epicSlug, currentStoryBranch, parentStoryBranch, reviewRetry, maxReviewRetries, createRetry, maxCreateRetries, integrationReviewDone, integrationReviewBranch, status, ... }`.
         3. Read the sprint-status file at `sprintStatus`. Its `development_status` map is the
            SOURCE OF TRUTH for which stories are `done` / `in-progress` / `backlog`.
 
@@ -397,10 +404,20 @@ nodes:
           `epic-<epic>-retrospective` keys themselves) and count how many are `done`. An epic only
           qualifies when that count equals the TOTAL number of such story keys for that epic — not
           merely the ones touched so far this run — AND the epic is not already in `completedEpics`
-          (prefer `currentEpic` first if it qualifies, since that's almost always the epic that was
-          just finished).
+          AND sprint-status's own `epic-{N}-retrospective` key is NOT already `done` (a defect-fix
+          re-run can make every story in an epic `done` again without that epic having been newly
+          completed — its retrospective already exists from the original pass and must not be
+          re-run; only a genuinely FIRST-time-done epic, whose retrospective key is still `optional`,
+          qualifies here) (prefer `currentEpic` first if it qualifies, since that's almost always the
+          epic that was just finished).
           - If such an epic is found: set `currentEpic` = that epic, `phase = "retro"`.
-        - Else (no target story pending, and every fully-done epic already has a retrospective):
+        - Else if `integrationReviewDone` is not yet `true` in `state.json`: set
+          `phase = "integrate_review"` (see that phase below). This runs exactly ONCE per run, after
+          every targeted story is `done` and every newly-completed epic's retrospective (if any) has
+          fired — a final cross-story audit that a clean per-story review cannot catch, since each
+          story's own review only ever sees that story's own diff.
+        - Else (no target story pending, every fully-done epic already has a retrospective, and the
+          integration review has already run this run):
           - Set `status = "complete"`, `phase = "done"`.
         Update `state.json`. End turn.
 
@@ -659,12 +676,92 @@ nodes:
         - Append `{currentEpic}` to `completedEpics`. Set `currentEpic = null`, `phase = "select"`.
         Update `state.json`. End turn.
 
+        ## phase = "integrate_review"  → cross-story integration rebuild + antagonistic review (NON-BLOCKING, runs ONCE)
+        Only reached when `stackedBranching` is `true` and every targeted story is `done` and any
+        newly-completed epic's retrospective has already fired. A per-story review only ever sees
+        that one story's own diff — it cannot catch a gap that only exists at the seam BETWEEN
+        stories (e.g. story A adds a processor module but the story that's supposed to wire it into
+        the live pipeline never actually does so). This phase closes that gap: it rebuilds the whole
+        current story stack on a disposable branch and runs one antagonistic, requirements-driven
+        review across the merged result before the run is allowed to reach `status = "complete"`.
+
+        1. **Determine the full current stack**, not just the stories this run touched: `git -C
+           {root} branch -a --list 'feat/*/story-*'`, sorted by epic number then story number. This
+           is every rung of the stack that exists in the repo today, whether or not this particular
+           run modified it — the review must audit the whole feature as it stands now, since a fix
+           to an early story can only be validated by seeing how it composes with everything after it.
+        2. **Resolve the stack's true base** the same way `select` step 0 resolves it: if any
+           `feat/*/story-*` branches exist, their collective ancestor is whichever commit `git -C
+           {root} merge-base` reports for the FIRST (lowest epic.story) branch against
+           `{defaultBranch}`. If none exist, skip this whole phase (nothing to integrate), set
+           `integrationReviewDone = true`, `phase = "select"`, and end turn.
+        3. **Create a fresh, local-only integration branch** — never reuse a name from a previous
+           run, and never push this branch anywhere. Compute `{runTimestamp}` yourself right now
+           (`date +%Y%m%d-%H%M%S`, or reuse one already recorded in `state.json` from a prior
+           iteration of THIS phase — e.g. if a merge conflict or review had to be re-attempted, keep
+           the same branch name rather than creating a new one each retry) so concurrent/repeated
+           runs never collide:
+           `git -C {root} checkout -b integration/review-{runTimestamp} <that base commit>`
+           and record `integrationReviewBranch = "integration/review-{runTimestamp}"` in
+           `state.json` immediately, before doing anything else in this phase.
+        4. **Merge every stack branch into it, in sprint order** (lowest epic.story first):
+           `git -C {root} merge --no-ff <branch> -m "merge: <branch> into integration/review-{runTimestamp} (post-fix verification)"`
+           for each branch in turn.
+           - **If any merge conflicts**: `git -C {root} merge --abort`, record the branch and the
+             conflicting file list in `state.json`'s `reason`, set `status = "needs-attention"`,
+             `phase = "done"`. Do NOT attempt to resolve the conflict yourself — a conflict here means
+             the stack itself is no longer cleanly stacked (e.g. a fix commit landed without a
+             follow-up rebase of dependent branches), which needs a human decision, not an
+             autonomous merge resolution. Update `state.json`. End turn.
+           - If every merge is clean (the expected outcome for a properly stacked/rebased set of
+             branches), continue.
+        5. **Run one antagonistic, requirements-driven review** of the fully-merged integration
+           branch. Prefer spawning this as a separate subagent/task (if your runtime exposes a
+           Task-style tool, use it) so the review has a clean, unbiased context rather than reusing
+           this phase's own conversation; if no such tool is available, perform the review yourself
+           in this same turn instead of skipping it. Either way, the review must:
+           - Read the FULL PRD, epics/acceptance-criteria file, architecture document, and feature
+             spec (whatever this project's `bmad-prd`/`bmad-create-epics-and-stories`/
+             `bmad-architecture`/`bmad-spec` skills produced — resolve their paths via
+             `{planningArtifacts}`/`{implementationArtifacts}` in `bmad-env.json`, not guessed paths).
+           - Read every story file in `{implementationArtifacts}` for stories in this stack.
+           - Inspect the ACTUAL merged code on `integration/review-{runTimestamp}` — not just story
+             files' claims — to verify each acceptance criterion is genuinely satisfied, including
+             criteria that only make sense when multiple stories/epics compose together.
+           - Be adversarial: assume guilty until proven innocent by the code; do not pad the report
+             with trivia.
+           - Classify every finding as CRITICAL / HIGH / MEDIUM / LOW with file/line evidence and a
+             quote proving the gap, exactly as a `bmad-code-review`-style adversarial pass would, but
+             scoped to the WHOLE merged stack rather than one story's diff.
+           - Write the findings to `{planningArtifacts}/integration-review-{date}.md` (or
+             `{implementationArtifacts}/` if `planningArtifacts` is unavailable) with a summary table
+             of finding counts by severity.
+        6. **Branch on the outcome:**
+           - **0 CRITICAL and 0 HIGH findings**: set `integrationReviewDone = true`, note the clean
+             report's path in `state.json`, `phase = "select"` (which will now fall through to
+             `status = "complete"`). Update `state.json`. End turn.
+           - **1+ CRITICAL or 1+ HIGH findings**: do NOT attempt to auto-fix — a cross-story
+             integration gap is exactly the kind of "significant change" `bmad-correct-course` exists
+             to triage (it may need new fix-stories, not a blind patch). Set `integrationReviewDone =
+             true` (the review itself is done; only the fix-decision is pending), set `status =
+             "needs-attention"`, `phase = "done"`, and record the findings-report path plus a one-line
+             summary of the CRITICAL/HIGH counts in `state.json`'s `reason`. Update `state.json`. End
+             turn.
+        7. Leave the `integration/review-{runTimestamp}` branch in place either way (local-only,
+           never pushed) — it is the exact artifact the findings report was reviewed against, so a
+           human (or a follow-up `bmad-correct-course` cycle) can inspect it directly.
+
         ---
 
         ## COMPLETION
         After updating `state.json`, check `status`:
         - `status == "complete"` → output exactly: <promise>BMAD_RUN_COMPLETE</promise>
         - `status == "failed"`   → output exactly: <promise>BMAD_RUN_COMPLETE</promise>
+        - `status == "needs-attention"` → output exactly: <promise>BMAD_RUN_COMPLETE</promise>
+          (all target stories were implemented and reviewed clean, but the final cross-story
+          integration review found CRITICAL/HIGH findings — this is a distinct terminal state from
+          `failed`: the per-story work genuinely succeeded, but a human must now decide how to
+          address the integration-level findings, e.g. via `bmad-correct-course`.)
         - otherwise → do NOT output any completion signal. Just end your turn; the loop continues.
 
   # ─── Phase 2: Report ─────────────────────────────────────────────────
@@ -684,7 +781,13 @@ nodes:
 
       Report:
       ### Outcome
-      - Final status, and (if failed) the escalation reason verbatim.
+      - Final status, and (if `failed` or `needs-attention`) the escalation reason verbatim.
+      - If `status == "needs-attention"`: call this out prominently — every targeted story was
+        implemented and passed its own code review, but the final cross-story integration review
+        (merging the full current stack onto a disposable `integration/review-*` branch) found
+        CRITICAL/HIGH findings. Surface the findings-report path from `reason` and note that a human
+        should review it and likely run `bmad-correct-course` next, the same way a manual antagonistic
+        review would be handled.
       ### Stories
       - Table of each targeted story: final sprint-status, and whether it was committed this run.
       ### Epics & Retrospectives
