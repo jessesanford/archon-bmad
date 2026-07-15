@@ -10,6 +10,14 @@ description: |
         -> commit — then fires a per-epic retrospective when every story in an epic is done.
         sprint-status.yaml is the single source of truth; the loop verifies against it,
         never trusting a session that merely "looks done."
+        In stacked-branching mode, also runs a repeatable per-epic rebase/rebuild/test/review
+        integration-validation cycle, and — if that cycle finds a functional-test failure or a
+        CRITICAL/HIGH review finding classified as a safe implementation-fidelity fix — an
+        auto-correct-course loop (<=3 retries) that root-causes it, applies the minimal fix ONLY on
+        the individual story branch that owns the affected file (never on the disposable
+        integration branch), cascades that fix forward through the stack, and re-runs the whole
+        validation cycle from scratch, escalating to a human only when a finding isn't safe to
+        auto-fix or the retry cap is exhausted.
   NOT for: Planning/spec work (use BMAD's planning agents first), bug fixes, PR reviews.
 
   Port of github.com/bmad-code-org/bmad-automator (MIT) onto the Archon workflow engine.
@@ -274,6 +282,11 @@ nodes:
         "currentValidationEpic": null,
         "validationBranch": null,
         "functionalTestSummary": null,
+        "integrationFixRetry": 0,
+        "maxIntegrationFixRetries": 3,
+        "integrationFailureSource": null,
+        "integrationFailureDetail": null,
+        "integrationFixLog": [],
         "status": "running",
         "reason": ""
       }
@@ -322,7 +335,7 @@ nodes:
 
         ## FIRST — load your state (every iteration)
         1. Read `$ARTIFACTS_DIR/bmad-env.json` → `{ root, outputFolder, implementationArtifacts, planningArtifacts, sprintStatus, skipAutomate, stackedBranching, defaultBranch, rebaseRemote, upstreamAvailable, ghAvailable, ghStackAvailable }`.
-        2. Read `$ARTIFACTS_DIR/state.json` → `{ phase, currentStory, currentEpic, epicSlug, currentStoryBranch, parentStoryBranch, reviewRetry, maxReviewRetries, createRetry, maxCreateRetries, epicsValidated, currentValidationEpic, validationBranch, functionalTestSummary, status, ... }`.
+        2. Read `$ARTIFACTS_DIR/state.json` → `{ phase, currentStory, currentEpic, epicSlug, currentStoryBranch, parentStoryBranch, reviewRetry, maxReviewRetries, createRetry, maxCreateRetries, epicsValidated, currentValidationEpic, validationBranch, functionalTestSummary, integrationFixRetry, maxIntegrationFixRetries, integrationFailureSource, integrationFailureDetail, integrationFixLog, status, ... }`.
         3. Read the sprint-status file at `sprintStatus`. Its `development_status` map is the
            SOURCE OF TRUTH for which stories are `done` / `in-progress` / `backlog`.
 
@@ -715,11 +728,13 @@ nodes:
 
         ## phase = "rebase_cascade"  → step 1/4 of per-epic validation: refresh the stack against upstream
         Entered whenever `currentValidationEpic` is set — either right after that epic's
-        retrospective lands (see the `retro` phase's ending) or as `select`'s catch-all safety net
+        retrospective lands (see the `retro` phase's ending), as `select`'s catch-all safety net
         for a run where no NEW retrospective fired this run (a defect-fix pass, for example) but the
-        highest fully-done epic still isn't in `epicsValidated`. This is step 1 of the four-step
-        per-epic validation cycle — `rebase_cascade` → `integration_build` → `functional_test` →
-        `integrate_review` — that runs cumulatively through `{currentValidationEpic}` every time an
+        highest fully-done epic still isn't in `epicsValidated`, or as the loop-back target from
+        `auto_correct_course` after it commits a fix to one or more story branches (in which case
+        `currentValidationEpic` is already set from the cycle that just failed — do not re-derive
+        it). This is step 1 of the four-step per-epic validation cycle — `rebase_cascade` →
+        `integration_build` → `functional_test` → `integrate_review` — that runs cumulatively through `{currentValidationEpic}` every time an
         epic completes (see [Post-fix / post-epic integration validation] in the project README for
         the full rationale). The goal of this step specifically: make sure every `feat/*/story-*`
         branch up to and including `{currentValidationEpic}` is rebased fresh onto the real upstream
@@ -887,10 +902,18 @@ nodes:
            - **Any test fails (epic-level OR project-level)**: this is direct, executable proof of a
              cross-story or cross-epic break — do NOT treat it as a soft signal or let it pass
              through to the review phase silently, and do NOT attempt to fix it yourself in this
-             phase. A functional break is exactly the kind of "significant change"
-             `bmad-correct-course` exists to triage, same as an antagonistic-review finding. Set
-             `status = "needs-attention"`, record which test(s) failed (and whether epic-level or
-             project-level) and their output in `state.json`'s `reason`, `phase = "done"`.
+             phase (this phase never edits story code, only generates/runs tests on
+             `{validationBranch}`). Record which test(s) failed (and whether epic-level or
+             project-level), their full output, and the implicated file(s) in
+             `integrationFailureDetail`, set `integrationFailureSource = "functional_test"`, then:
+             - `integrationFixRetry < maxIntegrationFixRetries` → `phase = "auto_correct_course"`
+               (root-cause it and attempt a real fix — see that phase below — rather than halting
+               immediately).
+             - `integrationFixRetry >= maxIntegrationFixRetries` → the auto-fix budget is exhausted
+               and the break is still present; this is exactly the kind of "significant change"
+               `bmad-correct-course` exists to triage by a human. Set `status = "needs-attention"`,
+               `phase = "done"`, and record in `reason` which test(s) still fail plus
+               "exhausted {maxIntegrationFixRetries} auto-correct-course cycles."
            Update `state.json`. End turn.
 
         ## phase = "integrate_review"  → step 4/4: antagonistic requirements-driven review
@@ -937,15 +960,106 @@ nodes:
              `functionalTestSummary` (all `null`), `phase = "select"` (resume normal selection —
              which will now either move on to the next epic's own story work, or fall through to
              `status = "complete"` if nothing else is pending).
-           - **1+ CRITICAL or 1+ HIGH findings**: do NOT attempt to auto-fix — a cross-story
-             integration gap is exactly the kind of "significant change" `bmad-correct-course` exists
-             to triage (it may need new fix-stories, not a blind patch). Set `status =
-             "needs-attention"`, `phase = "done"`, and record the findings-report path plus a
-             one-line summary of the CRITICAL/HIGH counts in `state.json`'s `reason`.
+           - **1+ CRITICAL or 1+ HIGH findings**: record the findings-report path and a one-line
+             summary of the CRITICAL/HIGH counts (plus each finding's file/line evidence) in
+             `integrationFailureDetail`, set `integrationFailureSource = "integrate_review"`, then:
+             - `integrationFixRetry < maxIntegrationFixRetries` → `phase = "auto_correct_course"`
+               (classify and, if safe, fix each finding — see that phase below — rather than
+               escalating immediately; a cross-story integration gap is only automatically fixable
+               when it's an unambiguous implementation-fidelity defect, never a design/scope
+               question).
+             - `integrationFixRetry >= maxIntegrationFixRetries` → the auto-fix budget is exhausted.
+               Set `status = "needs-attention"`, `phase = "done"`, and record in `reason` the
+               findings-report path, the CRITICAL/HIGH counts, and "exhausted
+               {maxIntegrationFixRetries} auto-correct-course cycles."
            Update `state.json`. End turn.
         3. Leave `{validationBranch}` in place either way (local-only, never pushed) — it is the
            exact artifact the findings report and functional tests were run against, so a human (or
            a follow-up `bmad-correct-course` cycle) can inspect it directly.
+
+        ## phase = "auto_correct_course"  → self-healing loop: root-cause, fix, re-validate
+        Entered from `functional_test` (a real test failure) or `integrate_review` (1+ CRITICAL/HIGH
+        findings) whenever `integrationFixRetry < maxIntegrationFixRetries`. This mirrors what a
+        human runs manually via `bmad-correct-course` when integration validation finds a genuine
+        cross-story regression, but scoped to the narrow, mechanical class of defect that's safe to
+        fix without a human decision: a stale caller/test that never got updated after a DIFFERENT,
+        already-landed story's intentional API/contract change. Anything less clear-cut escalates
+        instead of guessing.
+
+        **THE HARD RULE — read this before touching anything**: a fix must NEVER be committed on
+        `{validationBranch}` (the disposable integration branch) and NEVER left as an uncommitted
+        worktree edit. `{validationBranch}` is rebuilt from scratch every cycle (see
+        `integration_build`), so anything fixed only there is silently discarded and the same defect
+        would resurface on every future validation run. Every fix MUST be committed and pushed to the
+        actual individual story branch (`feat/{epicSlug}/story-*` or equivalent) that owns the
+        affected file — the same branch that will eventually be opened as its own PR — exactly as if
+        a human had root-caused it and run `bmad-correct-course` by hand.
+
+        1. **Root-cause.** Using `integrationFailureSource` and `integrationFailureDetail`:
+           - `"functional_test"`: for each failing test, inspect the actual error (assertion,
+             exception, signature mismatch) and use `git -C {root} log -p` / `git -C {root} blame` on
+             both the failing test file and the production file(s) it exercises to find the commit
+             that changed the contract. Identify which side is authoritative (the commit that
+             intentionally changed an API/behavior, on the story that owns that production file) and
+             which side is stale (a test or caller on a DIFFERENT story that was never updated to
+             match).
+           - `"integrate_review"`: read the findings report at the path recorded in
+             `integrationFailureDetail`. For each CRITICAL/HIGH finding, use its own file/line
+             evidence to identify the implicated file(s), then `git -C {root} log` / `git blame`
+             those files to find which story last touched the defective content.
+        2. **Classify every root-caused issue, one at a time:**
+           - **Safe to auto-fix** — an unambiguous implementation-fidelity defect against an
+             already-approved acceptance criterion or API contract: a stale caller/test not updated
+             after a later, intentional, already-landed change; a missing wire-up between two
+             already-correct pieces; an assertion checking the wrong thing. This is the "Minor:
+             Direct Adjustment" tier from `bmad-correct-course`'s own classification.
+           - **NOT safe to auto-fix** — anything involving ambiguous design intent, conflicting
+             acceptance criteria, a gap implying a missing story/epic, or genuine uncertainty about
+             which side is "correct." Do not guess and do not touch code. Set `status =
+             "needs-attention"`, `phase = "done"`, and record in `reason` exactly which finding(s)
+             need a human decision and why they don't qualify as a safe direct fix. End turn
+             immediately — do not proceed to step 3 for ANY finding this cycle if even one finding
+             in the batch is unsafe (a partial autonomous fix on top of an unresolved ambiguous one
+             risks compounding the mess).
+        3. **For every safe fix, in stack order (lowest epic.story first):**
+           a. Determine the owning branch: enumerate the stack (`git -C {root} branch -a --list
+              'feat/{epicSlug}/story-*'` or equivalent, in stack order) and find the first/owning
+              branch whose tree already contains the current (defective) version of the affected
+              file — typically the story identified by `git log`/`git blame` in step 1.
+           b. Check out that branch. If it's locked by another worktree (e.g. a concurrently-running
+              Archon session — discover via `git -C {root} worktree list`), perform the fix directly
+              in that other worktree's path instead of failing.
+           c. Resync before editing: `git -C {root} reset --hard origin/<owning-branch>` (never trust
+              a possibly-stale local checkout).
+           d. Apply the MINIMAL correct fix — match the pattern the authoritative/already-landed
+              commit established (see step 1), don't invent a new one.
+           e. Run just the affected test(s)/file's own tests to confirm green before committing.
+           f. Commit with subject `fix(correct-course): <short description> (epic
+              {currentValidationEpic} integration review)` and a body naming the specific
+              test/finding and why this branch is the correct owner.
+           g. Push: `git -C {root} push --force-with-lease origin <owning-branch>` (retry once on a
+              transient network failure; if it still fails after retry, record it in
+              `integrationFixLog` and `state.json`'s `reason` but do not abort the whole phase over
+              one push — flag it for the final report the same way `rebase_cascade` does for its own
+              transient failures).
+           h. If another, higher-in-the-stack branch also needs a fix this cycle, cascade-rebase
+              every branch between the one just fixed and that next one onto the new tip first
+              (same `git rebase --onto` mechanics as `rebase_cascade`), so the next fix always lands
+              on top of a branch that already contains this cycle's prior fixes and nothing is
+              edited twice.
+        4. **Record the cycle.** Append one entry to `integrationFixLog`: `{ epic:
+           currentValidationEpic, retry: integrationFixRetry, fixes: [ { branch, commitSha,
+           summary } ] }`.
+        5. **Reset for re-validation.** Increment `integrationFixRetry`. Clear
+           `integrationFailureSource` / `integrationFailureDetail` (`null`), clear
+           `validationBranch` / `functionalTestSummary` (`null` — both are stale and about to be
+           rebuilt from the fixed stack). Set `phase = "rebase_cascade"` — this re-runs the FULL
+           four-step cycle from scratch: `rebase_cascade` re-freshens and cascades every branch in
+           scope (including ones this cycle didn't touch, since their upstream base may have moved),
+           `integration_build` rebuilds a brand-new disposable branch with a fresh timestamp suffix,
+           and `functional_test`/`integrate_review` re-verify against the corrected code — proving
+           the fix is real, not just plausible.
+        6. Update `state.json`. End turn.
 
         ---
 
@@ -955,9 +1069,11 @@ nodes:
         - `status == "failed"`   → output exactly: <promise>BMAD_RUN_COMPLETE</promise>
         - `status == "needs-attention"` → output exactly: <promise>BMAD_RUN_COMPLETE</promise>
           (all target stories were implemented and reviewed clean, but the final cross-story
-          integration review found CRITICAL/HIGH findings — this is a distinct terminal state from
-          `failed`: the per-story work genuinely succeeded, but a human must now decide how to
-          address the integration-level findings, e.g. via `bmad-correct-course`.)
+          integration validation still found a problem after either a finding was classified
+          unsafe to auto-fix, or `maxIntegrationFixRetries` auto-correct-course cycles were
+          exhausted — this is a distinct terminal state from `failed`: the per-story work genuinely
+          succeeded, but a human must now decide how to address the integration-level findings,
+          e.g. via `bmad-correct-course`.)
         - otherwise → do NOT output any completion signal. Just end your turn; the loop continues.
 
   # ─── Phase 2: Report ─────────────────────────────────────────────────
@@ -970,7 +1086,7 @@ nodes:
       Generate a concise run report for this BMAD implementation run.
 
       Read:
-      1. `$ARTIFACTS_DIR/state.json` — final status (`complete`/`failed`), completedStories, completedEpics, reason, `stackedBranching`, `epicSlug`.
+      1. `$ARTIFACTS_DIR/state.json` — final status (`complete`/`failed`), completedStories, completedEpics, reason, `stackedBranching`, `epicSlug`, `integrationFixRetry`, `integrationFixLog`.
       2. `$ARTIFACTS_DIR/bmad-env.json` — sprint-status path, and `mainRoot` / `inWorktree` / `workBranch` / `baseBranch` / `stackedBranching` / `ghAvailable`.
       3. The sprint-status file (from bmad-env.json) — final per-story status.
       4. `git -C <root> log --oneline -30` — the commits this run produced (root = the worktree).
@@ -981,9 +1097,19 @@ nodes:
       - If `status == "needs-attention"`: call this out prominently — every targeted story was
         implemented and passed its own code review, but the final cross-story integration review
         (merging the full current stack onto a disposable `integration/review-*` branch) found
-        CRITICAL/HIGH findings. Surface the findings-report path from `reason` and note that a human
-        should review it and likely run `bmad-correct-course` next, the same way a manual antagonistic
-        review would be handled.
+        CRITICAL/HIGH findings or a functional test failure that could not be fully auto-resolved.
+        Surface the findings-report path from `reason` and note that a human should review it and
+        likely run `bmad-correct-course` next, the same way a manual antagonistic review would be
+        handled.
+      ### Auto-correct-course cycles
+      - If `integrationFixLog` is non-empty: for each cycle, list the epic, retry number, and every
+        `{ branch, commitSha, summary }` fix it applied — call out explicitly that each fix landed
+        on its own individual story branch (never the disposable integration branch) and was
+        cascaded forward before re-validation re-ran. State the final `integrationFixRetry` count
+        against `maxIntegrationFixRetries` so it's clear whether the loop resolved things itself or
+        ran out of budget.
+      - If empty/absent: state plainly that integration validation passed clean on the first attempt
+        with no auto-fix cycles needed (or that stacked-branching mode wasn't in use).
       ### Stories
       - Table of each targeted story: final sprint-status, and whether it was committed this run.
       ### Epics & Retrospectives

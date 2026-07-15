@@ -53,7 +53,7 @@ archon workflow list | grep archon-bmad
 
 | Workflow                                                | Automates                                                                 |
 | ------------------------------------------------------- | ------------------------------------------------------------------------- |
-| [`archon-bmad-story-automator`](#archon-bmad-story-automator) | The BMAD implementation loop — create → dev → review → commit per story, with per-epic retrospectives and (in [stacked-branching](#stacked-branching--pr-automation) mode) a repeatable, per-epic [integration rebuild, functional test & antagonistic review cycle](#per-epic-integration-rebuild-functional-test--antagonistic-review). |
+| [`archon-bmad-story-automator`](#archon-bmad-story-automator) | The BMAD implementation loop — create → dev → review → commit per story, with per-epic retrospectives and (in [stacked-branching](#stacked-branching--pr-automation) mode) a repeatable, per-epic [integration rebuild, functional test & antagonistic review cycle](#per-epic-integration-rebuild-functional-test--antagonistic-review) that, on failure, attempts a bounded [auto-correct-course self-healing loop](#auto-correct-course-the-self-healing-loop) before escalating to a human. |
 
 _More workflows will be added here over time._
 
@@ -84,6 +84,7 @@ For each selected story it plays one role per loop iteration, verifying against 
 | `integration_build` | — | *Stacked-branching mode only* — rebuilds a disposable cumulative integration branch from the freshly-rebased stack |
 | `functional_test` | — | *Stacked-branching mode only* — generates-if-missing and runs cumulative epic-level and project-level acceptance tests |
 | `integrate_review` | — | *Stacked-branching mode only* — antagonistic requirements-driven review of the disposable branch, corroborated by the passing functional tests — see [Per-epic integration rebuild, functional test & antagonistic review](#per-epic-integration-rebuild-functional-test--antagonistic-review) |
+| `auto_correct_course` | — | *Stacked-branching mode only* — root-causes a `functional_test`/`integrate_review` failure, fixes it (on the owning story branch only) if safe, and loops back to `rebase_cascade`; escalates otherwise — see [Auto-correct-course: the self-healing loop](#auto-correct-course-the-self-healing-loop) |
 
 When everything in your selection is `done`, each completed epic has had its retrospective, and the
 highest completed epic's validation cycle (above) has run, the run finishes and emits a report.
@@ -307,15 +308,73 @@ finished:
    `CRITICAL`/`HIGH`/`MEDIUM`/`LOW` with file/line evidence, written to
    `{planningArtifacts}/integration-review-epic-{N}-<date>.md`.
 
-**Branches on the outcome, doesn't auto-fix:**
-- **0 CRITICAL / 0 HIGH** → every epic from the lowest not-yet-validated epic through the current one is
-  appended to `epicsValidated`, and the run resumes normal selection (next epic's stories, or `status =
-  "complete"` if nothing else is pending).
-- **1+ CRITICAL or HIGH finding, or any functional test failure** → the run halts with `status =
-  "needs-attention"` (distinct from `failed` — every individual story genuinely passed its own review;
-  the gap is cross-story/cross-epic) and the final report points at the findings file and recommends
-  running BMad's `bmad-correct-course` workflow, since this is exactly the kind of "significant change"
-  that process exists to triage (it may need new fix-stories, not a blind patch).
+**Branches on the outcome — auto-fixes narrow, mechanical defects, escalates the rest:**
+- **0 CRITICAL / 0 HIGH, all tests pass** → every epic from the lowest not-yet-validated epic through
+  the current one is appended to `epicsValidated`, and the run resumes normal selection (next epic's
+  stories, or `status = "complete"` if nothing else is pending).
+- **1+ CRITICAL or HIGH finding, or any functional test failure** → rather than halting immediately,
+  the run enters [`auto_correct_course`](#auto-correct-course-the-self-healing-loop): if the failure
+  root-causes to an unambiguous implementation-fidelity defect (a stale caller/test never updated
+  after a different, already-landed story's intentional API change), it's fixed automatically — on
+  the correct owning story branch, never the disposable one — and the whole four-step cycle re-runs
+  from `rebase_cascade` to prove the fix is real. This repeats up to `maxIntegrationFixRetries` times
+  (default 3). The run only halts with `status = "needs-attention"` (distinct from `failed` — every
+  individual story genuinely passed its own review; the gap is cross-story/cross-epic) if a finding
+  is judged NOT safe to auto-fix (ambiguous design intent, conflicting requirements, a gap implying a
+  missing story/epic) or the retry budget is exhausted with the problem still present. Either way,
+  the final report points at the findings file / test failure and recommends running BMad's
+  `bmad-correct-course` workflow by hand, since a human decision is now unavoidable.
+
+#### Auto-correct-course: the self-healing loop
+
+A functional-test failure or a CRITICAL/HIGH integration-review finding is *proof* something is
+broken, but not everything broken this way needs a human in the loop. The most common case observed
+in practice: Story A lands and — correctly, deliberately — changes a function's signature or a
+module's behavior; Story B (already merged, maybe epics earlier) still calls the old signature in its
+own test or a downstream caller, because Story B was written before Story A's change ever landed.
+Every story's own per-story review passes (each diff looks internally consistent), yet the composed
+stack is broken. This is exactly the class of defect that's mechanical to fix once root-caused: there
+is one unambiguously correct answer (match the newer, already-landed, intentional contract), no
+design judgment call required.
+
+`auto_correct_course` is deliberately narrow about what it will fix on its own:
+
+- **Root-cause first.** For a test failure, `git log -p` / `git blame` on both the failing test and
+  the production code it exercises to find which commit changed the contract and which side never
+  caught up. For a review finding, the finding's own file/line evidence plus `git blame` to find the
+  owning story.
+- **Classify before touching anything.** Only an unambiguous implementation-fidelity defect against
+  an already-approved contract is "safe to auto-fix" — the same "Minor: Direct Adjustment" tier
+  `bmad-correct-course` itself would assign. Anything involving ambiguous intent, conflicting
+  acceptance criteria, or a gap that implies a missing story/epic is left alone entirely — no partial
+  autonomous fix is applied if even one finding in the batch doesn't qualify — and the run escalates
+  to `needs-attention` immediately instead of guessing.
+- **The fix always lands on the owning story branch — never on the disposable integration
+  branch.** This is a hard rule, not a preference: the integration/validation branch is rebuilt from
+  scratch every cycle, so anything fixed only there is silently thrown away and the defect would
+  resurface on every future run. The phase determines which individual `feat/*/story-*` branch's
+  tracked file actually contains the defective content (via `git log`/`git blame`, same mechanism a
+  human would use), checks that branch out (working around a worktree lock if another session has it
+  checked out), resyncs against `origin` first, applies the minimal fix, runs just that file's own
+  tests, commits with a message referencing the finding, and pushes with `--force-with-lease` — the
+  exact same branch that will eventually be opened as its own PR. If multiple branches need fixes,
+  each is fixed in stack order and cascade-rebased forward before the next one is touched, so nothing
+  is edited twice and no fix is ever "lost" underneath a later one.
+- **Then it proves the fix, it doesn't just assert it.** After committing/pushing, the phase loops
+  back to `rebase_cascade` — the *entire* four-step cycle re-runs from a completely fresh disposable
+  integration branch and a fresh functional-test pass, so a green result here is real end-to-end
+  proof, not just "the diff looks right."
+- **Bounded and auditable.** `maxIntegrationFixRetries` (default 3) caps how many cycles this can run
+  before forcing escalation regardless of classification. Every cycle's fixes (branch, commit SHA,
+  summary) are appended to `integrationFixLog` in `state.json`, and the final report surfaces the full
+  log — which branches were touched, what was fixed, and how many retries were used — so a human
+  reviewing a `complete` run can still see exactly what the automation changed on its own.
+
+This is intentionally a *narrower* trust boundary than the per-story `review` phase's own inline
+auto-fix (which only ever touches one story's own diff, already scoped to a single branch). Crossing
+epic/story boundaries to fix something on a DIFFERENT branch than the one currently being worked is a
+bigger blast radius, which is exactly why the classification step exists as a hard gate before any
+edit is made.
 
 **When this cycle triggers:**
 - **Eagerly**, right when an epic's own retrospective (`retro` phase) lands, covering that epic and
