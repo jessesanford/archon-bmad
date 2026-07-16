@@ -18,6 +18,12 @@ description: |
         integration branch), cascades that fix forward through the stack, and re-runs the whole
         validation cycle from scratch, escalating to a human only when a finding isn't safe to
         auto-fix or the retry cap is exhausted.
+        After every selected story is done and the complete stack is clean, it prepares sanitized
+        PR-ready branches, revalidates their cumulative tree, stages every component PR as a draft
+        against one target base, creates a permanent draft combined-stack validation PR, waits for
+        target-repository checks, and only then marks component PRs ready. The invocation must
+        explicitly say "submit", "release", "open PRs", or "publish PRs" to authorize side effects;
+        otherwise the workflow stops after its exact dry-run package.
   NOT for: Planning/spec work (use BMAD's planning agents first), bug fixes, PR reviews.
 
   Port of github.com/bmad-code-org/bmad-automator (MIT) onto the Archon workflow engine.
@@ -172,7 +178,7 @@ nodes:
       # rule (e.g. via .agents/rules/story-branching-stacked-prs.mdc, projected to
       # .cursor/rules/ or elsewhere), this workflow switches into stacked-branching mode:
       # a new "branch" phase creates/checks out each story's own branch before create/dev,
-      # and the "commit" phase pushes + opens a stacked PR. Repos WITHOUT this rule keep
+      # and the "commit" phase pushes it for later PR-ready release. Repos WITHOUT this rule keep
       # the original single-worktree-branch behavior unchanged (STACKED_BRANCHING=false).
       RULE_FILE=""
       for rf in "$ROOT/.agents/rules/story-branching-stacked-prs.mdc" \
@@ -188,12 +194,12 @@ nodes:
         cp -L "$RULE_FILE" "$ART/branching-rule.md" 2>/dev/null || true
       fi
 
-      # The repo's real default/integration branch (origin/HEAD, else origin/main, else
-      # "main") -- distinct from this RUN's own worktree branch and from whatever branch
-      # the live checkout happened to be on. This is what the FIRST story of a NEW epic
-      # stacks on; every later story in that epic stacks on the previous story's branch.
-      DEFAULT_BRANCH="$(git -C "$ROOT" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')"
-      [ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH="main"
+      # The required integration branch is literal "main" -- distinct from this run's own
+      # worktree branch and from whatever branch the live checkout happened to be on. This is
+      # what the first story stacks on; every later story stacks on the previous story's branch.
+      # Release policy is intentionally one literal base: main. Do not follow origin/HEAD to
+      # master or another branch and silently submit the stack to the wrong integration target.
+      DEFAULT_BRANCH="main"
 
       # ─── Rebase remote (for the rebase_cascade phase) ────────────────────────────────
       # Some repos are forks that push their work to "origin" but the real, canonical
@@ -208,6 +214,11 @@ nodes:
         REBASE_REMOTE="upstream"
         UPSTREAM_AVAILABLE=true
       fi
+      TARGET_MAIN_AVAILABLE=false
+      if git -C "$ROOT" fetch "$REBASE_REMOTE" main >/dev/null 2>&1 && \
+         git -C "$ROOT" rev-parse --verify "refs/remotes/$REBASE_REMOTE/main^{commit}" >/dev/null 2>&1; then
+        TARGET_MAIN_AVAILABLE=true
+      fi
 
       # gh / gh-stack availability -- best-effort PR automation only; never required.
       GH_AVAILABLE=false
@@ -216,6 +227,36 @@ nodes:
       if [ "$GH_AVAILABLE" = true ]; then
         gh extension list 2>/dev/null | grep -qi 'github/gh-stack' && GH_STACK_AVAILABLE=true
       fi
+
+      # Human authorization is immutable run input, not an LLM substring guess made immediately
+      # before side effects. Only explicit affirmative release phrases authorize PR creation.
+      ARG_LOWER="$(printf '%s' "$ARGUMENTS" | tr '[:upper:]' '[:lower:]')"
+      RELEASE_AUTHORIZED=false
+      RELEASE_AUTHORIZATION_PHRASE=""
+      case "$ARG_LOWER" in
+        *"do not release"*|*"don't release"*|*"never release"*|\
+        *"do not submit"*|*"don't submit"*|*"never submit"*|\
+        *"do not open the final prs"*|*"don't open the final prs"*|*"never open the final prs"*|\
+        *"do not publish the final prs"*|*"don't publish the final prs"*|*"never publish the final prs"*|\
+        *"without releasing"*|*"without submitting"*|*"document how to submit"*)
+          ;;
+        *"release and submit the final pr stack"*)
+          RELEASE_AUTHORIZED=true
+          RELEASE_AUTHORIZATION_PHRASE="release and submit the final PR stack"
+          ;;
+        *"submit the final pr stack"*)
+          RELEASE_AUTHORIZED=true
+          RELEASE_AUTHORIZATION_PHRASE="submit the final PR stack"
+          ;;
+        *"open the final prs"*)
+          RELEASE_AUTHORIZED=true
+          RELEASE_AUTHORIZATION_PHRASE="open the final PRs"
+          ;;
+        *"publish the final prs"*)
+          RELEASE_AUTHORIZED=true
+          RELEASE_AUTHORIZATION_PHRASE="publish the final PRs"
+          ;;
+      esac
 
       # ─── Worktree branch (for the final report's integration instructions) ──────────
       # Archon runs each workflow in its own worktree on a branch it names automatically
@@ -263,9 +304,20 @@ nodes:
       }
       EOF
 
+      INITIAL_PHASE="select"
+      INITIAL_STATUS="running"
+      INITIAL_REASON=""
+      INITIAL_ATTENTION="null"
+      if [ "$TARGET_MAIN_AVAILABLE" != true ]; then
+        INITIAL_PHASE="done"
+        INITIAL_STATUS="needs-attention"
+        INITIAL_REASON="Target remote $REBASE_REMOTE does not expose the required literal main branch."
+        INITIAL_ATTENTION='"target"'
+      fi
+
       cat > "$ART/state.json" <<EOF
       {
-        "phase": "select",
+        "phase": "$INITIAL_PHASE",
         "currentStory": null,
         "currentEpic": null,
         "epicSlug": null,
@@ -287,8 +339,23 @@ nodes:
         "integrationFailureSource": null,
         "integrationFailureDetail": null,
         "integrationFixLog": [],
-        "status": "running",
-        "reason": ""
+        "releaseStatus": "pending",
+        "releaseAuthorized": $RELEASE_AUTHORIZED,
+        "releaseAuthorizationPhrase": "$RELEASE_AUTHORIZATION_PHRASE",
+        "releaseFixRetry": 0,
+        "maxReleaseFixRetries": 3,
+        "releaseEvidence": null,
+        "prReadyArtifact": null,
+        "submissionManifest": null,
+        "submissionJournal": null,
+        "componentPrs": [],
+        "integrationPr": null,
+        "componentDraftState": null,
+        "integrationDraftState": null,
+        "ciCheckStatus": null,
+        "attentionKind": $INITIAL_ATTENTION,
+        "status": "$INITIAL_STATUS",
+        "reason": "$INITIAL_REASON"
       }
       EOF
 
@@ -299,7 +366,9 @@ nodes:
       echo "  stackedBranching:  $STACKED_BRANCHING (rule: ${RULE_FILE:-none found})"
       echo "  defaultBranch:     $DEFAULT_BRANCH"
       echo "  rebaseRemote:      $REBASE_REMOTE (upstreamAvailable=$UPSTREAM_AVAILABLE)"
+      echo "  targetMain:        $TARGET_MAIN_AVAILABLE"
       echo "  gh/gh-stack:       gh=$GH_AVAILABLE gh-stack=$GH_STACK_AVAILABLE"
+      echo "  releaseAuthorized: $RELEASE_AUTHORIZED (${RELEASE_AUTHORIZATION_PHRASE:-no affirmative phrase})"
     timeout: 30000
 
   # ─── Phase 1: The implementation loop ────────────────────────────────
@@ -315,7 +384,7 @@ nodes:
     idle_timeout: 1800000
     loop:
       until: BMAD_RUN_COMPLETE
-      max_iterations: 150
+      max_iterations: 200
       fresh_context: true
       until_bash: |
         grep -qE '"status"[[:space:]]*:[[:space:]]*"(complete|failed|needs-attention)"' "$ARTIFACTS_DIR/state.json"
@@ -335,7 +404,7 @@ nodes:
 
         ## FIRST — load your state (every iteration)
         1. Read `$ARTIFACTS_DIR/bmad-env.json` → `{ root, outputFolder, implementationArtifacts, planningArtifacts, sprintStatus, skipAutomate, stackedBranching, defaultBranch, rebaseRemote, upstreamAvailable, ghAvailable, ghStackAvailable }`.
-        2. Read `$ARTIFACTS_DIR/state.json` → `{ phase, currentStory, currentEpic, epicSlug, currentStoryBranch, parentStoryBranch, reviewRetry, maxReviewRetries, createRetry, maxCreateRetries, epicsValidated, currentValidationEpic, validationBranch, functionalTestSummary, integrationFixRetry, maxIntegrationFixRetries, integrationFailureSource, integrationFailureDetail, integrationFixLog, status, ... }`.
+        2. Read `$ARTIFACTS_DIR/state.json` → `{ phase, currentStory, currentEpic, epicSlug, currentStoryBranch, parentStoryBranch, reviewRetry, maxReviewRetries, createRetry, maxCreateRetries, epicsValidated, currentValidationEpic, validationBranch, functionalTestSummary, integrationFixRetry, maxIntegrationFixRetries, integrationFailureSource, integrationFailureDetail, integrationFixLog, releaseStatus, releaseAuthorized, releaseAuthorizationPhrase, releaseFixRetry, maxReleaseFixRetries, releaseEvidence, prReadyArtifact, submissionManifest, submissionJournal, componentPrs, integrationPr, componentDraftState, integrationDraftState, ciCheckStatus, attentionKind, status, ... }`.
         3. Read the sprint-status file at `sprintStatus`. Its `development_status` map is the
            SOURCE OF TRUTH for which stories are `done` / `in-progress` / `backlog`.
 
@@ -460,7 +529,10 @@ nodes:
           — in stacked-branching mode — the highest fully-done epic has already completed its
           validation cycle; single-branch mode has no stack to cascade/rebuild/test in the first
           place):
-          - Set `status = "complete"`, `phase = "done"`.
+          - If `stackedBranching` is `true`, `releaseStatus != "complete"`, and EVERY story key in
+            sprint-status is `done` (not merely every story in the user's current selection), set
+            `phase = "pr_ready"`. Never release a partially completed sprint.
+          - Otherwise set `status = "complete"`, `phase = "done"`.
         Update `state.json`. End turn.
 
         ## phase = "branch"  — create/checkout this story's own branch, stacked on the previous one
@@ -609,56 +681,12 @@ nodes:
            The single commit MUST contain, together: the implementation, any review fixes, the updated
            story file (`Status: done`), AND sprint-status.yaml (`development_status[{currentStory}] =
            done`). Never split the `done` flip into a separate commit.
-        3. If `stackedBranching` is `true`, push this story's branch and open its stacked PR.
-           Best-effort only in the sense that a genuine push/PR failure (`gh` missing, offline, no
-           permission) must NEVER fail the story or the run — log a warning and continue to "Then
-           advance" below regardless. It is NOT best-effort in the sense of accepting a wrong base:
-           getting the base branch wrong silently defeats the entire point of a stacked PR, so treat
-           a wrong-base PR as a bug to prevent, not an acceptable shortcut.
-
-           - Push: `git -C {root} push -u origin {currentStoryBranch}`.
-           - **Resolve `<owner>/<repo>` by parsing `git -C {root} remote get-url origin` yourself**
-             (strip the host and `.git` suffix from the URL to get `<owner>/<repo>`) and pass it
-             explicitly as `--repo <owner>/<repo>` to every `gh` call below. Do **not** rely on `gh`'s
-             own implicit repo resolution (bare `gh pr create`/`gh pr list` with no `--repo`, or
-             `gh api repos/:owner/:repo`) — when a repo has both an `origin` (your fork/working repo)
-             and an `upstream` remote configured, that implicit resolution can silently pick
-             `upstream` instead of `origin`, which then makes `parentStoryBranch` (which only exists
-             on `origin`) look like it doesn't exist on "the repo" at all. That false negative is
-             exactly the kind of bug that produces a PR silently opened against the wrong base — if a
-             remote-branch-existence check ever comes back negative, double check it was actually run
-             against `<owner>/<repo>` parsed from `origin`, not gh's default, before trusting a "not
-             found" result.
-           - Idempotency check first (a resumed/retried run may have already opened this story's PR):
-             `gh pr list --repo <owner>/<repo> --head {currentStoryBranch} --json number,url`. If a
-             PR already exists, skip straight to recording it (do not create a second one) — but if
-             its `baseRefName` is wrong (not `{parentStoryBranch}`), fix it with `gh pr edit
-             --repo <owner>/<repo> <number> --base {parentStoryBranch}` before moving on; do not leave
-             a known-wrong base in place just because *a* PR exists.
-           - Else, if `ghStackAvailable` is `true`, actually attempt the native path first — do not
-             skip straight to the manual fallback just because it seems simpler:
-             `gh stack init {parentStoryBranch} {currentStoryBranch}` (adopts both branches into a
-             stack; safe to re-run — ignore a failure that indicates they're already adopted) then
-             `gh stack submit --auto --open`. Only fall through to the manual command below if this
-             genuinely fails for a structural reason (e.g. the extension errors that stacked PRs
-             aren't enabled for this repo/host) — not merely because an earlier, wrongly-scoped
-             remote-branch check made `{parentStoryBranch}` look unavailable.
-           - Manual fallback (also the only path when `ghAvailable` is `true` but `ghStackAvailable`
-             is `false`, or `gh stack` genuinely doesn't work on this host): create explicitly against
-             the resolved repo and the resolved parent branch — never omit `--base`, and never
-             substitute `defaultBranch`/`main` for `{parentStoryBranch}` (per the branching
-             convention, `{parentStoryBranch}` equals `defaultBranch` only for the very first story
-             of the very first epic ever worked in this repo — every other story, including an
-             epic's first, stacks on an actual prior story branch):
-             `gh pr create --repo <owner>/<repo> --base {parentStoryBranch} --head
-             {currentStoryBranch} --title "<story title from the story file>" --body "<short summary
-             + link to the story file path>"`.
-           - If `ghAvailable` is `false`, skip PR creation entirely and just note in your turn's
-             summary that the branch was pushed (if it was) and a PR needs opening manually with
-             `--base {parentStoryBranch}`.
-           - Record whatever PR number/URL resulted (or that none could be created) — mention it in
-             your turn's summary so the final `report` node can surface it; do not create a second
-             commit just to persist this.
+        3. If `stackedBranching` is `true`, push the source story branch to `origin` with
+           `git -C {root} push -u origin {currentStoryBranch}`. Do NOT create a PR here. Source
+           branches still need later cascade rebases, integration corrections, sanitization, and
+           PR-ready regeneration; exposing them now creates stale or unsafe review surfaces.
+           Final PR creation is owned exclusively by the `pr_ready` through `submit_finalize`
+           release phases below.
         Then advance:
         - Append `{currentStory}` to `completedStories`. Set `currentStory = null`, `reviewRetry = 0`.
         - Determine epic completion by mechanical enumeration, not impression — this check has
@@ -742,10 +770,16 @@ nodes:
         order — exactly the manual cascade-rebase procedure this project used once by hand, now
         automated so the stack never drifts stale across a long multi-epic run.
 
+        Invoke **bmad-rebase-cascade** in autonomous mode. The deterministic contract below is the
+        acceptance boundary for that skill; do not replace its ancestry and force-with-lease safety
+        checks with ad hoc git commands.
+
         1. **Resolve the upstream-of-record.** Use `{rebaseRemote}` from `bmad-env.json` (`upstream`
            if that remote exists in this repo, else `origin` — resolved once in `init`, see
            [Requirements]) and `{defaultBranch}`. Fetch it fresh: `git -C {root} fetch {rebaseRemote}
-           {defaultBranch}`. The new base tip is `git -C {root} rev-parse
+           {defaultBranch}`. If the literal `main` ref does not exist, fail closed with
+           `status = "needs-attention"` and `attentionKind = "target"`; never substitute `master` or
+           another default branch. The new base tip is `git -C {root} rev-parse
            {rebaseRemote}/{defaultBranch}`.
         2. **Fast-forward the local `{defaultBranch}` itself — never rebase or rewrite it.**
            `git -C {root} checkout {defaultBranch} && git -C {root} merge --ff-only
@@ -978,13 +1012,17 @@ nodes:
            a follow-up `bmad-correct-course` cycle) can inspect it directly.
 
         ## phase = "auto_correct_course"  → self-healing loop: root-cause, fix, re-validate
-        Entered from `functional_test` (a real test failure) or `integrate_review` (1+ CRITICAL/HIGH
-        findings) whenever `integrationFixRetry < maxIntegrationFixRetries`. This mirrors what a
+        Entered from `functional_test` (a real test failure), `integrate_review` (1+ CRITICAL/HIGH
+        findings), or `release_validate` (a PR-ready lint/test/build/review failure) after that
+        caller has enforced its own retry cap. This mirrors what a
         human runs manually via `bmad-correct-course` when integration validation finds a genuine
         cross-story regression, but scoped to the narrow, mechanical class of defect that's safe to
         fix without a human decision: a stale caller/test that never got updated after a DIFFERENT,
         already-landed story's intentional API/contract change. Anything less clear-cut escalates
         instead of guessing.
+
+        Invoke **bmad-correct-course** in autonomous mode with the structured failure evidence. The
+        classification and branch-ownership rules below remain hard safety rails for that skill.
 
         **THE HARD RULE — read this before touching anything**: a fix must NEVER be committed on
         `{validationBranch}` (the disposable integration branch) and NEVER left as an uncommitted
@@ -1007,6 +1045,10 @@ nodes:
              `integrationFailureDetail`. For each CRITICAL/HIGH finding, use its own file/line
              evidence to identify the implicated file(s), then `git -C {root} log` / `git blame`
              those files to find which story last touched the defective content.
+           - `"release_validate"`: read the structured failed command/finding records from
+             `integrationFailureDetail` and `releaseEvidence` (when present), then trace each changed
+             file back to its owning source story. Treat formatter/lint rewrites as code changes that
+             must land on a source branch, not on the PR-ready or integration branch.
         2. **Classify every root-caused issue, one at a time:**
            - **Safe to auto-fix** — an unambiguous implementation-fidelity defect against an
              already-approved acceptance criterion or API contract: a stale caller/test not updated
@@ -1029,8 +1071,10 @@ nodes:
            b. Check out that branch. If it's locked by another worktree (e.g. a concurrently-running
               Archon session — discover via `git -C {root} worktree list`), perform the fix directly
               in that other worktree's path instead of failing.
-           c. Resync before editing: `git -C {root} reset --hard origin/<owning-branch>` (never trust
-              a possibly-stale local checkout).
+           c. Resync before editing without destructive reset: require a clean owning-branch
+              worktree, fetch `origin/<owning-branch>`, and fast-forward with
+              `git merge --ff-only origin/<owning-branch>`. If it diverged, stop
+              `needs-attention`; never discard local or remote commits.
            d. Apply the MINIMAL correct fix — match the pattern the authoritative/already-landed
               commit established (see step 1), don't invent a new one.
            e. Run just the affected test(s)/file's own tests to confirm green before committing.
@@ -1048,9 +1092,12 @@ nodes:
               on top of a branch that already contains this cycle's prior fixes and nothing is
               edited twice.
         4. **Record the cycle.** Append one entry to `integrationFixLog`: `{ epic:
-           currentValidationEpic, retry: integrationFixRetry, fixes: [ { branch, commitSha,
+           currentValidationEpic, retry: <releaseFixRetry when source is release_validate, otherwise
+           integrationFixRetry>, source: integrationFailureSource, fixes: [ { branch, commitSha,
            summary } ] }`.
-        5. **Reset for re-validation.** Increment `integrationFixRetry`. Clear
+        5. **Reset for re-validation.** Increment `integrationFixRetry` only for
+           `functional_test`/`integrate_review`; `release_validate` already incremented and capped
+           `releaseFixRetry` before entering this phase. Clear
            `integrationFailureSource` / `integrationFailureDetail` (`null`), clear
            `validationBranch` / `functionalTestSummary` (`null` — both are stale and about to be
            rebuilt from the fixed stack). Set `phase = "rebase_cascade"` — this re-runs the FULL
@@ -1063,17 +1110,161 @@ nodes:
 
         ---
 
+        ## phase = "pr_ready"  → build the sanitized reviewer stack
+        Reached only after every sprint story is done and the source stack has completed the full
+        rebase/build/test/antagonistic-review loop. Invoke **bmad-pr-ready** in autonomous mode over
+        the complete ordered source stack.
+
+        - The LLM owns reviewer-facing summaries, story ownership, and ambiguous intent. The skill's
+          deterministic helpers own ancestry, changed-path allowlists, redaction scans, exact SHAs,
+          context limits, and fail-closed validation.
+        - Produce one cumulative PR-ready branch per planning/story layer without rewriting source
+          branches. Include the planning layer when the project has one.
+        - Reject credentials, generated artifacts, unrelated changes, hidden compatibility paths, or
+          a layer that cannot be traced to its source story. Do not "clean up" a violation by silently
+          dropping evidence.
+        - Persist the PR-ready artifact/manifest path in `prReadyArtifact`, set
+          `releaseStatus = "pr-ready"`, `phase = "release_validate"`, and update `state.json`.
+        - On any hard validator failure, set `status = "needs-attention"`,
+          `attentionKind = "integration"`, and `phase = "done"` with the exact invariant and artifact
+          path; do not submit a partial stack.
+        End turn.
+
+        ## phase = "release_validate"  → re-integrate the exact PR-ready heads
+        The source integration result is necessary but not sufficient: sanitization and PR-ready
+        branch construction changed the review artifact. Rebuild a durable cumulative integration
+        branch from the exact PR-ready heads, then invoke **bmad-integration-review** against that
+        branch in autonomous mode.
+
+        1. Read only compact structured evidence by default: ordered branch/SHA records, changed-path
+           summaries, test/build counts, and ranked review findings. Expand raw diffs or logs only for
+           a failing path or finding; never dump the whole estate into one prompt.
+        2. Run the repository's existing full lint/format gate (including `prek run --all-files` when
+           configured), full test commands, type/build/package commands, and all cumulative
+           acceptance tests. A targeted feature suite alone is not a release gate.
+        3. Build every distributable package affected by the stack and record artifact names and
+           SHA-256 values. Validate every cumulative prefix and the disabled feature-flag path.
+        4. Write and publish a durable validation report on the integration branch. The report must
+           state exact commands, counts, warnings/skips, artifact hashes, prefix coverage, base SHA,
+           PR-ready head SHAs, and the feature flag's safe default without recording credentials.
+        5. If any code-owned lint/test/build/review check fails, set
+           `integrationFailureSource = "release_validate"` and
+           `integrationFailureDetail`, set `currentValidationEpic` to the highest completed epic,
+           clear `releaseEvidence`, `prReadyArtifact`, and all stale submission fields, then set
+           `releaseStatus = "pending"`.
+           - When `releaseFixRetry < maxReleaseFixRetries`, increment `releaseFixRetry` and route to
+             `auto_correct_course`. That phase fixes the owning source story branch and repeats the
+             entire cascade/integration/PR-ready cycle; never patch only the integration branch.
+           - When the cap is exhausted, set `status = "needs-attention"`,
+             `attentionKind = "integration"`, and `phase = "done"` with the failed command/finding
+             paths in `reason`.
+        6. On success, store a structured `releaseEvidence` object in `state.json` containing the
+           target base SHA, ordered PR-ready branch/head SHAs, evidence branch, report path, evidence
+           commit SHA, exact commands and outcomes, package artifact hashes, prefix coverage, and
+           feature-flag disabled-path result. Set
+           `releaseStatus = "validated"`, `phase = "submit_dry_run"`.
+        End turn.
+
+        ## phase = "submit_dry_run"  → package one-base PR submission with no side effects
+        Invoke **bmad-submit-prs** using the PR-ready artifact and durable evidence.
+
+        - Target `upstream/{defaultBranch}` when an `upstream` remote exists; otherwise target
+          `origin/{defaultBranch}`. For fork-to-upstream submission, publish every head and the
+          evidence branch to `origin`; otherwise publish to the target remote. Never push branches
+          into upstream merely to host PR heads.
+        - Every component PR targets the same target base. Later layers may initially be cumulative;
+          their Stack Merge Gates must list every prerequisite and require ordered review/merge.
+        - Generate schema-v2 submission data with full 40-character base/head/evidence SHAs,
+          reviewer-facing feature name/summary, prefix-safety evidence, and no secrets.
+        - Run the submitter's live `--dry-run`. Its read-only preflight must validate authentication,
+          target/publish repository topology, permissions, immutable target base, exact remote heads,
+          existing PR conflicts, deterministic titles/bodies, and the permanent-draft combined-stack
+          validation PR.
+        - If manifest construction or dry-run fails, persist every available artifact and exact
+          invariant, then set `status = "needs-attention"`, `attentionKind = "submission"`, and
+          `phase = "done"`. Do not retry an ambiguous target or invent missing fields.
+        - Persist `submissionManifest` and the dry-run `submissionJournal`.
+        - Human gate: read immutable `releaseAuthorized` and `releaseAuthorizationPhrase` from
+          `state.json`; never reinterpret `$ARGUMENTS` here. If false, set
+          `status = "needs-attention"`, `attentionKind = "authorization"`, and report the exact
+          dry-run artifacts plus the accepted affirmative phrases. If true, record the exact phrase
+          that authorized this deterministic dry run and set `phase = "submit_stage"`.
+        End turn.
+
+        ## phase = "submit_stage"  → create complete draft review surfaces
+        Set the submission manifest's `draft` field to `true`, then run **bmad-submit-prs** with
+        `--apply`.
+
+        - New component PRs start as drafts; existing PRs must match exact declared heads/base.
+        - Create/update the combined integration PR from the evidence branch. It remains draft
+          permanently, says DO NOT MERGE, links every component, and explains that its checks prove
+          only the complete stack while code review/merging belongs to the ordered components.
+        - Finalize and audit every title, body, Stack Merge Gate, feature-flag safety statement,
+          integration-evidence link, navigation graph, and marker comment before recording success.
+        - Fail if any pre-existing component PR is already ready: checks must run while every
+          component is draft. After apply, query every component and the integration PR, persist
+          `componentDraftState = true` and `integrationDraftState = true`, and fail closed on any
+          mismatch.
+        - On any create/update/audit failure, persist the submission journal plus all observed PR
+          URLs and draft states, set `status = "needs-attention"`,
+          `attentionKind = "submission"`, and `phase = "done"`. Reruns must reconcile from those
+          artifacts; never blindly repeat side effects.
+        - Persist all component URLs and the integration PR URL in `componentPrs` / `integrationPr`;
+          set `releaseStatus = "checks-running"`, `phase = "ci_verify"`.
+        End turn.
+
+        ## phase = "ci_verify"  → require target-repository GitHub checks
+        Poll the combined integration PR's target-repository checks with bounded backoff for at most
+        30 minutes. Use structured check name/state/link records; fetch failed logs only on demand.
+
+        - Success requires at least one successful executed check and every discovered check in
+          a terminal successful or explicitly skipped state. Any pending, cancelled, timed-out, or
+          failed check blocks release whether or not GitHub labels it "required." Skipped jobs are
+          reported but never converted into a success claim.
+        - If checks fail because of code, lint, tests, packaging, or workflow changes in the stack,
+          persist `ciCheckStatus` plus current component/integration draft states, keep every
+          component draft, and stop `needs-attention` with failed job links. Do not rewrite an
+          already-published review head automatically.
+        - If checks fail because fork PRs cannot receive a target secret, a runner is unavailable, or
+          another target-only infrastructure precondition is missing, persist `ciCheckStatus` plus
+          current draft states, keep every component draft, and stop `needs-attention` with that
+          blocker and failed job links. Never call local green tests a substitute for GitHub checks.
+        - If 30 minutes elapse before the success condition, store the latest structured state,
+          set `status = "needs-attention"`, `attentionKind = "ci-timeout"`, and `phase = "done"`;
+          preserve all component drafts.
+        - For code-owned failures use `attentionKind = "ci-code"`; for target secret/runner/policy
+          blockers use `attentionKind = "ci-infrastructure"`.
+        - On success, store the structured check summary in `ciCheckStatus`, set
+          `phase = "submit_finalize"`.
+        End turn.
+
+        ## phase = "submit_finalize"  → make components reviewable, never the evidence PR
+        Change only the manifest's component intent to `draft = false` and rerun
+        **bmad-submit-prs**. Exact heads, bodies, navigation, base SHA, and GitHub checks must still
+        match. Immediately before the rerun, re-query and require every component still draft and
+        the integration PR still draft; fail closed if anything drifted. Mark component PRs ready in
+        order. The combined
+        validation PR remains draft permanently and must never be merged. Re-query every PR after
+        finalization: require every component ready (`componentDraftState = false`) and the combined
+        PR still draft (`integrationDraftState = true`).
+
+        On any pre-finalization drift or partial-finalization failure, persist the journal and exact
+        observed states, set `status = "needs-attention"`, `attentionKind = "submission"`, and
+        `phase = "done"`; never continue to the unconditional completion transition below.
+
+        Set `releaseStatus = "complete"`, `status = "complete"`, `phase = "done"`, update
+        `state.json`, and end turn.
+
+        ---
+
         ## COMPLETION
         After updating `state.json`, check `status`:
         - `status == "complete"` → output exactly: <promise>BMAD_RUN_COMPLETE</promise>
         - `status == "failed"`   → output exactly: <promise>BMAD_RUN_COMPLETE</promise>
         - `status == "needs-attention"` → output exactly: <promise>BMAD_RUN_COMPLETE</promise>
-          (all target stories were implemented and reviewed clean, but the final cross-story
-          integration validation still found a problem after either a finding was classified
-          unsafe to auto-fix, or `maxIntegrationFixRetries` auto-correct-course cycles were
-          exhausted — this is a distinct terminal state from `failed`: the per-story work genuinely
-          succeeded, but a human must now decide how to address the integration-level findings,
-          e.g. via `bmad-correct-course`.)
+          (`attentionKind` identifies whether a human decision is needed for integration,
+          authorization, target selection, submission, CI code, CI infrastructure, or CI timeout. Do not
+          describe every needs-attention outcome as a code defect.)
         - otherwise → do NOT output any completion signal. Just end your turn; the loop continues.
 
   # ─── Phase 2: Report ─────────────────────────────────────────────────
@@ -1086,7 +1277,11 @@ nodes:
       Generate a concise run report for this BMAD implementation run.
 
       Read:
-      1. `$ARTIFACTS_DIR/state.json` — final status (`complete`/`failed`), completedStories, completedEpics, reason, `stackedBranching`, `epicSlug`, `integrationFixRetry`, `integrationFixLog`.
+      1. `$ARTIFACTS_DIR/state.json` — final status (`complete`/`failed`), completedStories,
+         completedEpics, reason, `stackedBranching`, `epicSlug`, `integrationFixRetry`,
+         `integrationFixLog`, `releaseStatus`, `prReadyArtifact`, `submissionManifest`,
+         `submissionJournal`, `releaseEvidence`, `componentPrs`, `integrationPr`,
+         `componentDraftState`, `integrationDraftState`, `ciCheckStatus`, and `attentionKind`.
       2. `$ARTIFACTS_DIR/bmad-env.json` — sprint-status path, and `mainRoot` / `inWorktree` / `workBranch` / `baseBranch` / `stackedBranching` / `ghAvailable`.
       3. The sprint-status file (from bmad-env.json) — final per-story status.
       4. `git -C <root> log --oneline -30` — the commits this run produced (root = the worktree).
@@ -1094,13 +1289,15 @@ nodes:
       Report:
       ### Outcome
       - Final status, and (if `failed` or `needs-attention`) the escalation reason verbatim.
-      - If `status == "needs-attention"`: call this out prominently — every targeted story was
-        implemented and passed its own code review, but the final cross-story integration review
-        (merging the full current stack onto a disposable `integration/review-*` branch) found
-        CRITICAL/HIGH findings or a functional test failure that could not be fully auto-resolved.
-        Surface the findings-report path from `reason` and note that a human should review it and
-        likely run `bmad-correct-course` next, the same way a manual antagonistic review would be
-        handled.
+      - If `status == "needs-attention"`, branch the explanation by `attentionKind`:
+        `integration` recommends reviewing the findings and running `bmad-correct-course`;
+        `authorization` points to the completed dry run and accepted affirmative phrases;
+        `target` reports the missing literal `main` ref; `submission` reports the exact manifest,
+        journal, PR states, and failed invariant without suggesting blind retry; `ci-code` links
+        failing code-owned jobs;
+        `ci-infrastructure` identifies the withheld secret/runner/policy blocker without blaming
+        feature code; `ci-timeout` reports the last observed check states. Preserve draft-state
+        details for every CI outcome.
       ### Auto-correct-course cycles
       - If `integrationFixLog` is non-empty: for each cycle, list the epic, retry number, and every
         `{ branch, commitSha, summary }` fix it applied — call out explicitly that each fix landed
@@ -1114,20 +1311,26 @@ nodes:
       - Table of each targeted story: final sprint-status, and whether it was committed this run.
       ### Epics & Retrospectives
       - Which epics completed and which had a retrospective run.
+      ### Release
+      - Report `releaseStatus`, the PR-ready artifact, durable integration evidence branch/report,
+        target/publish repositories, immutable target base SHA, and submission journal.
+      - List component PRs in merge order with their Stack Merge Gate prerequisites.
+      - List the combined validation PR separately and state that it remains draft and must not be
+        merged. Summarize its GitHub checks honestly from `ciCheckStatus`; if the run stopped on a
+        target infrastructure/secret blocker, distinguish that from local validation without calling
+        the stack check-clean.
       ### Next steps
       <check if="stackedBranching is true (from bmad-env.json), instead of the single-worktree-branch section below">
       - This run used the repo's stacked-branch-per-story convention — no single `{workBranch}` holds
-        the work. Find each story's own branch and PR:
-          # list this epic's story branches (each one a separate, already-pushed stack rung):
+        the work. Source branches were pushed during implementation, but PRs were deliberately
+        deferred until the complete stack passed release validation and was converted to PR-ready
+        branches. Find the source branches with:
           `git -C <root> branch -a --list 'feat/{epicSlug}/story-*'`
-          # if gh is available, list the PRs actually opened this run:
-          `gh pr list --repo <owner>/<repo> --head <each-story-branch> --json number,url,baseRefName`
-        List each completed story's branch name, its base (the branch it stacked on), and its PR
-        URL/number if one exists (or "not opened — <reason>" if `ghAvailable` was false or PR
-        creation failed and was only logged). Note explicitly that these branches were pushed
-        directly to `origin` from the Archon worktree — nothing further to merge/integrate through
-        the worktree itself; the PRs are the integration path (review + merge each rung of the stack
-        in order, oldest story first). Still mention worktree teardown once all its PRs are merged:
+        Use `componentPrs` rather than source branches as the review/merge surface. If release stopped
+        before submission, report the exact dry-run package or blocker instead of suggesting ad hoc
+        `gh pr create` commands. When submitted, review and merge component PRs strictly in order;
+        never merge the combined validation PR. Mention worktree teardown once all component PRs are
+        merged:
           `archon complete {workBranch}` (`--force` only if you intend to discard rather than keep
           the now-merged branches around for reference).
       </check>

@@ -53,7 +53,7 @@ archon workflow list | grep archon-bmad
 
 | Workflow                                                | Automates                                                                 |
 | ------------------------------------------------------- | ------------------------------------------------------------------------- |
-| [`archon-bmad-story-automator`](#archon-bmad-story-automator) | The BMAD implementation loop — create → dev → review → commit per story, with per-epic retrospectives and (in [stacked-branching](#stacked-branching--pr-automation) mode) a repeatable, per-epic [integration rebuild, functional test & antagonistic review cycle](#per-epic-integration-rebuild-functional-test--antagonistic-review) that, on failure, attempts a bounded [auto-correct-course self-healing loop](#auto-correct-course-the-self-healing-loop) before escalating to a human. |
+| [`archon-bmad-story-automator`](#archon-bmad-story-automator) | The complete BMAD implementation and stacked-release loop: create → dev → review → correct → integrate → PR-ready → stage draft PRs → verify target checks → release ordered component PRs. |
 
 _More workflows will be added here over time._
 
@@ -73,21 +73,28 @@ For each selected story it plays one role per loop iteration, verifying against 
 
 | Phase    | BMAD skill invoked              | What happens                                                        |
 | -------- | ------------------------------- | ------------------------------------------------------------------ |
-| `branch` | —                                | *Only if the repo uses [stacked branching](#stacked-branching--pr-automation)* — checkout/create this story's own branch, stacked on the previous story's |
+| `branch` | —                                | *Only if the repo uses [stacked branching](#stacked-branching--release-automation)* — checkout/create this story's own branch, stacked on the previous story's |
 | `create` | `bmad-create-story`             | Write the next story file (YOLO, autonomous)                       |
 | `dev`    | `bmad-dev-story`                | Implement all `[ ]` tasks, run tests, tick checkboxes              |
 | `auto`   | `bmad-qa-generate-e2e-tests`    | Optional — test-gen; **auto-skipped** if the skill isn't installed |
 | `review` | _inlined adversarial reviewer_  | Attack impl vs story claims + git reality; auto-fix; **gate = 0 CRITICAL & 0 HIGH**; loops ≤ 8 |
-| `commit` | —                               | `git commit` after review verifies; if stacked branching is on, also pushes and opens/updates this story's PR |
+| `commit` | —                               | `git commit` after review verifies; stacked mode pushes the source branch but deliberately defers PR creation |
 | `retro`  | `bmad-retrospective`            | Fires per epic when every story in it is `done`; YOLO; non-blocking |
 | `rebase_cascade` | — | *Stacked-branching mode only* — refreshes the whole stack against upstream before rebuilding/testing/reviewing it — see [below](#per-epic-integration-rebuild-functional-test--antagonistic-review) |
 | `integration_build` | — | *Stacked-branching mode only* — rebuilds a disposable cumulative integration branch from the freshly-rebased stack |
 | `functional_test` | — | *Stacked-branching mode only* — generates-if-missing and runs cumulative epic-level and project-level acceptance tests |
 | `integrate_review` | — | *Stacked-branching mode only* — antagonistic requirements-driven review of the disposable branch, corroborated by the passing functional tests — see [Per-epic integration rebuild, functional test & antagonistic review](#per-epic-integration-rebuild-functional-test--antagonistic-review) |
 | `auto_correct_course` | — | *Stacked-branching mode only* — root-causes a `functional_test`/`integrate_review` failure, fixes it (on the owning story branch only) if safe, and loops back to `rebase_cascade`; escalates otherwise — see [Auto-correct-course: the self-healing loop](#auto-correct-course-the-self-healing-loop) |
+| `pr_ready` | `bmad-pr-ready` | Creates sanitized, reviewer-facing cumulative branches only after the complete source stack is clean |
+| `release_validate` | `bmad-integration-review` | Rebuilds the exact PR-ready stack and runs full lint, test, build, package, prefix, and disabled-feature validation |
+| `submit_dry_run` | `bmad-submit-prs` | Selects upstream/main or origin/main, renders one-base Stack Merge Gates, and performs live read-only preflight |
+| `submit_stage` | `bmad-submit-prs` | Creates/updates draft component PRs plus the permanent draft combined-stack validation PR |
+| `ci_verify` | — | Waits for target-repository checks and fails closed on code or target-infrastructure failures |
+| `submit_finalize` | `bmad-submit-prs` | Marks component PRs ready only after checks pass; the combined validation PR remains draft and must not merge |
 
-When everything in your selection is `done`, each completed epic has had its retrospective, and the
-highest completed epic's validation cycle (above) has run, the run finishes and emits a report.
+When every sprint story is `done`, each completed epic has had its retrospective, and the complete
+stack is clean, stacked mode runs the release phases above. A partial-story selection never releases
+an incomplete sprint.
 
 #### Review gating & automatic fixes
 
@@ -141,6 +148,11 @@ the other knobs) under [Configuration knobs](#configuration-knobs).
   - `bmad-create-story` *(required)*
   - `bmad-dev-story` *(required)*
   - `bmad-retrospective` *(required)*
+  - `bmad-rebase-cascade` *(required for stacked release)*
+  - `bmad-integration-review` *(required for stacked release)*
+  - `bmad-correct-course` *(required for stacked release correction loops)*
+  - `bmad-pr-ready` *(required for stacked release)*
+  - `bmad-submit-prs` *(required for stacked release)*
   - `bmad-qa-generate-e2e-tests` *(optional — the `auto` phase is skipped if absent)*
 
 The workflow defaults to the `claude` provider so the BMAD skills are auto-discovered. It works with
@@ -159,8 +171,9 @@ archon workflow run archon-bmad-story-automator "epic 2"
 # Implement specific stories
 archon workflow run archon-bmad-story-automator "stories 2-1 through 2-4"
 
-# Implement everything still pending in sprint-status
-archon workflow run archon-bmad-story-automator "all pending stories"
+# Implement, validate, and submit everything. Explicit release language authorizes PR side effects.
+archon workflow run archon-bmad-story-automator \
+  "all pending stories; release and submit the final PR stack"
 
 # Kick it off detached and watch it
 archon workflow run archon-bmad-story-automator "epic 2" --detach
@@ -221,13 +234,11 @@ Re-enter the **same** worktree (inputs already hydrated) to do more:
 live checkout (the copy step then no-ops — the gitignored inputs are already there). `--branch <name>` /
 `--from <ref>` control the worktree's branch and base point.
 
-#### Stacked branching & PR automation
+#### Stacked branching & release automation
 
-Some BMAD projects adopt a repo-wide convention of **one branch + one PR per story, chained as a
-stack**, instead of landing every story on one long branch — the standard "large PR is unreviewable"
-fix, using something like the [`gh-stack`](https://github.github.com/gh-stack/) extension or manual
-`gh pr create --base <previous-story-branch>`. This workflow **auto-detects** that convention and
-adapts, with zero configuration:
+Some BMAD projects adopt a repo-wide convention of one source branch per story. This workflow
+auto-detects the convention and uses those branches for implementation and correction, but it does
+**not** expose source branches as review PRs:
 
 - **Detection.** `init` looks for `.agents/rules/story-branching-stacked-prs.mdc` (or a
   `.cursor/rules/`/`.claude/rules/` projection of it). If found, the run switches into stacked-branching
@@ -242,22 +253,30 @@ adapts, with zero configuration:
   `project_name` in `_bmad/bmm/config.yaml`). Every story branches off the **previous story's own
   branch** — that's the "stack" — and this chaining crosses epic boundaries: an epic's **first** story
   branches off the **previous epic's last story branch**, not off the repo's default branch. The repo's
-  real default branch (`origin/HEAD` / `origin/main`) is only ever the parent for the very first story
-  of the very first epic ever worked in the repo. Any stray uncommitted changes are safety-stashed
-  before switching.
-- **Push + PR (extended `commit` phase).** After the atomic commit, the story's branch is pushed to
-  `origin` and its PR is opened with `--base` set to the branch it stacked on — via `gh stack submit` if
-  the [`gh-stack`](https://github.github.com/gh-stack/) `gh` extension is installed, else a plain
-  `gh pr create --base <parent-branch>`. Both push and PR creation are **best-effort**: a missing/
-  unauthenticated `gh`, no network, or a repo without native stacked-PR support never fails the story —
-  it's logged and left for the final report and a human to finish. Re-running is idempotent (an existing
-  PR for that branch is detected and left alone rather than duplicated).
-- **Report.** When `stackedBranching` was on, the final `report` node lists each completed story's own
-  branch, what it's based on, and its PR URL/number (via `gh pr list`) instead of the single-branch
-  merge instructions.
+  required integration branch (`main`) is only ever the parent for the very first story of the very
+  first epic ever worked in the repo. Any stray uncommitted changes are safety-stashed before
+  switching.
+- **Deferred PR creation.** `commit` pushes source branches to `origin` but creates no PR. The stack
+  may still be cascade-rebased, corrected, and regenerated without rewriting a reviewer-visible head.
+- **PR-ready release.** After every story is complete and cumulative validation is clean,
+  `bmad-pr-ready` creates sanitized cumulative review branches. The workflow re-integrates and
+  validates those exact heads, including the repository's full lint gate, tests, builds, package
+  hashes, every cumulative prefix, and the feature-disabled path.
+- **One literal target base.** `bmad-submit-prs` targets `upstream/main` when available, otherwise
+  `origin/main`, and fails rather than substituting `master` or another detected default branch.
+  Component heads remain on the publish fork and every PR targets the same base.
+  Explicit Stack Merge Gates list prerequisites and require review/merge in order.
+- **Draft staging and target checks.** Components are staged as drafts. A separate permanent-draft
+  combined-stack PR runs the target repository's checks against the total tree, links all components,
+  and says DO NOT MERGE. Component PRs become ready only after those checks pass. Fork-secret or
+  runner failures remain visible blockers; local green tests are never presented as equivalent proof.
+- **Human authorization.** The initial workflow argument must include one exact affirmative phrase:
+  `release and submit the final PR stack`, `submit the final PR stack`, `open the final PRs`, or
+  `publish the final PRs`. Explicit negations override them. Without authorization, the workflow
+  stops after the exact live dry run and reports its artifacts without creating PRs.
 
 This requires no changes to the rule file's location or content beyond what your project already uses
-for [the convention itself](https://github.com/github/gh-stack) — the workflow only *reads* it.
+for the convention itself.
 
 #### Per-epic integration rebuild, functional test & antagonistic review
 
@@ -392,7 +411,7 @@ the very end of a multi-epic run, so drift and cross-story/cross-epic gaps never
 up unnoticed.
 
 **Single-branch (non-stacked) projects**: this cycle is a deliberate no-op. Without the
-[stacked-branching convention](#stacked-branching--pr-automation) every story already lands on the same
+[stacked-branching convention](#stacked-branching--release-automation) every story already lands on the same
 one worktree branch, so there's no separate `feat/*/story-*` branches to rebuild or merge — `select`'s
 catch-all never fires, and the run completes exactly as it always has. You only get real cross-story
 integration validation by adopting stacked branching.
@@ -407,7 +426,7 @@ Edit `workflows/archon-bmad-story-automator.yaml` to taste:
   expensive part; drop `build-loop` to `sonnet` to trade quality for cost. If you'd rather use Archon
   tier presets (`small`/`medium`/`large`), configure them first with `archon ai tier set <tier>
   claude <model>` — unconfigured tier names fail to resolve.
-- `build-loop.loop.max_iterations` (default `150`) — raise for very large multi-epic runs.
+- `build-loop.loop.max_iterations` (default `200`) — raise for very large multi-epic runs.
 - `build-loop.idle_timeout` (default `1800000` ms = 30 min) — raise if `dev-story` sessions run long.
 - `build-loop.loop.until` / retry counts (`maxReviewRetries`, `maxCreateRetries`) — tune the gates.
 
@@ -422,7 +441,9 @@ This is a faithful port of the *pipeline*, deliberately simplified for the Archo
   `bmad-story-automator-review` skill), so you don't need to install that review skill separately.
 - **No programmatic complexity scoring / per-story agent selection.** Archon handles provider/model
   selection via config tiers; set the loop `model` (or tiers) once.
-- **Commit-only, like the upstream** — it does not open PRs. Add a final node if you want one.
+- **Release-aware stacked mode** — unlike the upstream automator, it can prepare PR-ready branches,
+  stage one-base component PRs, create a permanent draft combined-stack checks PR, and make components
+  ready only after target checks pass.
 
 Everything else — the `create → dev → auto → review(≤8) → commit` per-story sequence, the
 adversarial review gate (see [Review gating & automatic fixes](#review-gating--automatic-fixes)),
